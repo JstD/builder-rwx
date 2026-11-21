@@ -50,13 +50,18 @@ For each patch the selector does three things.
    failed once (it ran far over its time rather than giving a wrong result).
    `BR_DROP=0` turns the rule off.
 
-   The TPC-DS executor test can also go when something unrelated failed. Its
-   guard is the quick candidates from the executor's test file (at least three)
-   plus the optimizer's TPC-H test when that is a candidate. If the whole guard
-   passes, the test is let go. A failure among the other tests then ends only
-   the other tests; the guard still runs. This is a second accepted risk: on 127
-   practice commits where the guard passed, the long test still failed in 5.
-   `BR_GUARD=0` turns it off.
+   Either long test can also go when something unrelated failed. Its guard is
+   the quick candidates from its own test file (at least three) plus the cheap
+   candidates that read a SQL fixture it reads; for the TPC-DS executor test that
+   is the optimizer's TPC-H test. With fewer than three from its file, a
+   fixture-sharing test must be there to vouch for it. If the whole guard passes,
+   the long test is let go. A failure among the other tests then ends only the
+   other tests; the guard still runs. Commits with more than 500 candidates are
+   left alone. This is a second accepted risk. On practice commits aimed at the
+   lines the long tests run: for TPC-DS with three or more from its file the
+   guard passed 127 times and the test still failed in 5; with fewer than three,
+   40 times and 0; for `test_max_nodes`, 21 times and 0. `BR_GUARD=0` turns it
+   off.
 
 5. **Runs fixture-only commits on what changed.** Two SQL fixtures are read by
    61 tests, because the executor's class setup loads them, and one of those
