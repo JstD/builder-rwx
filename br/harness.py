@@ -49,6 +49,7 @@ class Items:
     submitted = 0  # pool tasks seen in this test that belong to no loader item
     only_pool = None  # indices allowed to run, or None for all
     only_loader = None  # fixture -> indices allowed, or None for all
+    only_checked = False  # an item outside only_pool is skipped only with its pinned input
     on_switch = None  # the tracer's callback(key)
 
     # Delta mode, for a commit that changes fixture files and no code. Whatever a
@@ -175,8 +176,11 @@ class InlinePool:
                 if Items.only_pool is not None and future.item[1] not in Items.only_pool:
                     # Not selected: it cannot reach the change, so it would give what
                     # it gave on the pinned commit. The tests take None as "no result".
-                    future.set_result(None)
-                    return future
+                    # When the code has changed that also needs the item's input to be
+                    # what it was: the change may have run while the input was made.
+                    if not Items.only_checked or self._same_as_pinned(future.item[1], fn, args, kwargs):
+                        future.set_result(None)
+                        return future
                 if Items.record is not None or Items.delta_pinned is not None:
                     if self._same_as_pinned(future.item[1], fn, args, kwargs):
                         future.set_result(None)

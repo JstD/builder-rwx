@@ -95,6 +95,17 @@ DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
 # in 5. TPC-DS, fewer than three: 40 times, 0 failed. test_max_nodes: 21 times, 0.
 GUARD = os.environ.get("BR_GUARD", "1") == "1"
 SHARE_TABLES = os.environ.get("BR_SHARE_TABLES", "1") == "1"  # see harness.SharedTables
+
+# An exact answer for a long test that is one loop over independent items (the
+# executor's TPC-DS test and its 99 queries). maps/items.json says which items run
+# each source line. When a commit only changes code inside functions, an item that
+# runs none of the changed lines and is handed the same input does what it did on
+# the pinned commit, so running the other items alone gives the test's verdict. It
+# is used when those items are few enough to cost at most ITEMS_MAX_CPU.
+# BR_ITEMS=0 turns it off.
+ITEMS = os.environ.get("BR_ITEMS", "1") == "1"
+ITEMS_MAX_CPU = float(os.environ.get("BR_ITEMS_MAX", "6.0"))
+ITEMS_BASE_CPU = 2.5  # class setup, parsing every query, pickling the tables
 GUARD_FILES = ("tests/test_executor.py", "tests/test_parser.py")
 GUARD_MIN = 3
 GUARD_SHARE_CPU = 1.0  # a fixture-sharing test joins the guard when it costs no more than this
@@ -128,6 +139,7 @@ class Maps:
         self.importers = None
         self.outlines = None
         self.opened = None  # test -> files it opens, made on first need
+        self.item_map = None  # maps/items.json, read on first need
         self.tree = None  # ClassTree and readers.Finder, made on first need
         self.finder = None
         # the maps number tests as the pinned tests.json did; translate by id
@@ -201,6 +213,14 @@ class Maps:
     def readers(self, path: str) -> set[int]:
         runs = self.index["opens"].get(path)
         return self.tests(runs) if runs else set()
+
+    def items(self) -> dict:
+        if self.item_map is None:
+            try:
+                self.item_map = json.loads((self.directory / "items.json").read_text())
+            except (OSError, ValueError):
+                self.item_map = {}
+        return self.item_map
 
     def opened_by(self, number: int) -> list[str]:
         """Files the test opens as data."""
@@ -303,6 +323,8 @@ class Decision:
         self.drop_when_clean: set[int] = set()  # see DROP: long tests to let go, set by plan()
         self.data_candidates: set[int] = set()  # candidates because they read a changed data file
         self.guards: dict[int, set[int]] = {}  # see GUARD: long test -> the tests that vouch for it
+        self.spans: list[tuple[str, int, int]] = []  # old lines of the function-level changes
+        self.restricted: dict[int, tuple[list[int], float]] = {}  # see ITEMS: test -> (items, CPU)
         self.delta_files: list[str] = []  # SQL fixtures edited in place
         self.delta = False  # see DELTA: nothing but those changed
         self.delta_run = False  # set by plan(): run every candidate in delta mode
@@ -389,6 +411,8 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
                 else:
                     found = maps.lines(old_path, anchor.kind, anchor.start, anchor.end)
                 decision.broad |= found
+                if anchor.kind == pydiff.DEFERRED:
+                    decision.spans.append((old_path, anchor.start, anchor.end))
                 if anchor.probe:
                     decision.notes.append(f"{old_path}: {anchor!r}")
                     continue
@@ -459,6 +483,42 @@ def split(tests: list[int], seconds: list[float]) -> list[list[int]]:
     return best[1]
 
 
+def restricted_runs(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
+                    maps) -> dict[int, tuple[list[int], float]]:
+    """Long test -> (the items that can be affected, the CPU running them would cost),
+    for the long candidates that can be answered exactly and cheaply."""
+    found: dict[int, tuple[list[int], float]] = {}
+    if (not ITEMS or maps is None or not decision.runnable or decision.everything
+            or decision.kinds != {pydiff.DEFERRED} or not decision.spans):
+        return found
+    for long_test in decision.candidates:
+        if seconds[long_test] < BIG_SECONDS or run_cost[long_test] <= LONG_CPU:
+            continue
+        info = maps.items().get(tests[long_test]["id"])
+        if not info:
+            continue
+        affected: set[int] = set()
+        usable = True
+        for path, start, end in decision.spans:
+            wanted = range(start, end + 1)
+            if any(line in wanted for line in info["imports"].get(path, ())):
+                usable = False  # runs while modules load: its effect is not tied to an item
+                break
+            table = info["files"].get(path)
+            if table:
+                for line in wanted:
+                    index = table["lines"].get(str(line))
+                    if index is not None:
+                        affected.update(table["sets"][index])
+        if not usable:
+            continue
+        total = sum(info["weights"]) or 1.0
+        cost = ITEMS_BASE_CPU + run_cost[long_test] * sum(info["weights"][i] for i in affected) / total
+        if cost <= ITEMS_MAX_CPU:
+            found[long_test] = (sorted(affected), cost)
+    return found
+
+
 def guards_for(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
                maps) -> dict[int, set[int]]:
     """Long test -> its guard, for the long candidates the GUARD rule covers."""
@@ -509,25 +569,35 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
     Guard tests (``decision.guards``) come last. A failure among the other tests
     ends the other tests only; the guard still runs, until one of its own fails."""
     decision.guards = {}
+    decision.restricted = {}
     to_run = _plan(decision, tests, seconds, run_cost, setup_cost)
     if decision.delta_run:
         return to_run
-    guards = guards_for(decision, tests, seconds, run_cost, maps)
-    if not guards:
+    restricted = restricted_runs(decision, tests, seconds, run_cost, maps)
+    guards = {n: g for n, g in guards_for(decision, tests, seconds, run_cost, maps).items() if n not in restricted}
+    if not guards and not restricted:
         return to_run
     kept = sorted(decision.candidates)
-    without = [n for n in kept if n not in guards]
+    without = [n for n in kept if n not in guards and n not in restricted]
     saving = (approx_split(sum(seconds[n] for n in kept), max(seconds[n] for n in kept))
               - (approx_split(sum(seconds[n] for n in without), max(seconds[n] for n in without)) if without else 0.0))
     if saving < GUARD_GAIN:
         return to_run  # another long test stays anyway: nothing to gain
+    if restricted:
+        # an exact answer beats a guess: the test itself is run, on the items that matter
+        decision.restricted = restricted
+        decision.drop_when_clean -= set(restricted)
+        to_run = [n for n in to_run if n not in restricted] + sorted(restricted)
+    if not guards:
+        return to_run
     decision.guards = guards
     guard_tests = set().union(*guards.values())
 
     def by_cost(n):
         return (setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0) > 0.5, run_cost[n], n)
 
-    return [n for n in to_run if n not in guard_tests] + sorted(guard_tests, key=by_cost)
+    ordinary = [n for n in to_run if n not in guard_tests and n not in decision.restricted]
+    return ordinary + sorted(guard_tests, key=by_cost) + [n for n in to_run if n in decision.restricted]
 
 
 def _plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
@@ -759,16 +829,23 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             # module and its setUpClass, which for the executor loads every table.
             def limit_for(n):
                 setup = setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0)
+                if n in decision.restricted:
+                    return round(6 * (decision.restricted[n][1] + setup) + 5.0 * SPEED, 2)
                 if decision.delta_run and run_cost[n] > MAX_SINGLE_RUN:
                     return round(DELTA_LONG_LIMIT * max(1.0, SPEED) + 6 * setup, 2)
                 return round(6 * (run_cost[n] + setup) + 5.0 * SPEED, 2)
 
             guard_tests = set().union(*decision.guards.values()) if decision.guards else set()
-            limits = [(n, tests[n]["id"], limit_for(n), 1 if n in guard_tests else 0) for n in to_run]
-            wall = min(sum(limit for _, _, limit, _ in limits) + 10.0, max(5.0, deadline - time.monotonic()))
+            # flags: 1 a guard test, 3 a long test run on some of its items (always run)
+            limits = [(n, tests[n]["id"], limit_for(n),
+                       3 if n in decision.restricted else 1 if n in guard_tests else 0,
+                       decision.restricted[n][0] if n in decision.restricted else None)
+                      for n in to_run]
+            wall = min(sum(entry[2] for entry in limits) + 10.0, max(5.0, deadline - time.monotonic()))
             job = {"root": root, "tests": limits, "stop": not decision.delta_run, "wall": wall + 20.0,
                    "probe": decision.probe, "warm": slot.warm,
-                   "shared_tables": harness.SharedTables.rows is not None and shares_tables(decision, to_run)}
+                   "shared_tables": harness.SharedTables.rows is not None and shares_tables(decision, to_run),
+                   "pool": str(MAPS / "pool_inputs.json")}
             if decision.delta_run:
                 job["delta"] = {"pinned": CHECKOUT, "files": decision.delta_files,
                                 "pool": str(MAPS / "pool_inputs.json"),

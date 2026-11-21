@@ -63,6 +63,11 @@ def play(tests, seconds, run_cost, setup, decision, failing):
         passed = set()
         failed = guard_failed = False
         for number in to_run:
+            if number in decision.restricted:
+                cpu += decision.restricted[number][1]  # an exact answer for the long test
+                if number not in failing:
+                    kept.discard(number)
+                continue
             if not decision.delta_run and (guard_failed if number in guard_tests else failed):
                 continue
             key = tests[number]["id"].rsplit("::", 1)[0]

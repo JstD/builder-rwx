@@ -168,14 +168,30 @@ def _work(job: dict, out_fd: int):
         # together they decide whether a long test is kept.
         failed = guard_failed = False
         for position, (number, test_id, limit, *flags) in enumerate(job["tests"]):
-            guard = bool(flags and flags[0])
-            if stopping and (guard_failed if guard else failed):
+            flag = flags[0] if flags else 0
+            only = flags[1] if len(flags) > 1 else None
+            guard = flag == 1
+            if stopping and flag != 3 and (guard_failed if guard else failed):
                 continue
-            ok = session.run(test_id, limit)
+            if only is not None:
+                # A long test on the items a change can reach. An item left out is
+                # skipped only if it is also handed its pinned input (harness.Items).
+                if not harness.Items.pool_inputs:
+                    try:
+                        with open(job["pool"], encoding="utf-8") as handle:
+                            harness.Items.pool_inputs = json.load(handle)
+                    except (OSError, ValueError, KeyError):
+                        harness.Items.pool_inputs = {}
+                harness.Items.only_checked = True
+                ok = session.run(test_id, limit, {"P": only})
+                harness.Items.only_checked = False
+            else:
+                ok = session.run(test_id, limit)
             os.write(out_fd, b"R %d %d\n" % (number, 1 if ok else 0))
             if not ok and stopping:
-                failed = True
-                guard_failed = guard_failed or guard
+                if flag != 3:
+                    failed = True
+                    guard_failed = guard_failed or guard
                 continue
             if not ok and position < len(weights):
                 longest_failed = max(longest_failed, weights[position])

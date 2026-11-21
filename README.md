@@ -79,6 +79,16 @@ For each patch the selector does three things.
    changed code, so it is planned, and the long tests let go, exactly as for a
    commit with the code change alone. `BR_MIXED=0` turns it off.
 
+Where it is cheap, the TPC-DS executor test gets an exact answer instead. The
+test hands 99 queries to a process pool, and `maps/items.json` records which
+source lines each query runs. For a commit that only changes code inside
+functions, a query that runs none of the changed lines and is handed its pinned
+input does what it did on the pinned commit, so the test is run on the other
+queries alone ([br/harness.py](br/harness.py), `Items`). This is used when those
+queries cost at most 6 CPU seconds, and it replaces the guard. On 137 practice
+commits where it applies, its verdict matched the whole test's every time, for
+an eighth of the CPU. `BR_ITEMS=0` turns it off.
+
 One cost is shared between jobs. The executor's test class parses 32 CSV tables
 in its `setUpClass`, about a second of CPU in every job that runs one of its
 tests. The rows depend only on those files, so they are parsed once before the
@@ -129,6 +139,8 @@ python /repo/tools/class_tree.py /work/classes.json
 python /repo/tools/compile_map.py /repo/sample/tests.json /work/trace /work/timing.json /repo/maps
 cp /work/classes.json /repo/maps/classes.json
 python /repo/tools/outline.py /app/sqlglot /repo/maps
+BR_ITEMS=1 python /repo/tools/trace_one.py /repo/sample/tests.json 1106 /work/trace_items
+python /repo/tools/compile_items.py /repo/maps/items.json /work/trace_items/1106.json
 python /repo/tools/pool_inputs.py /repo/maps/pool_inputs.json \
   tests/test_executor.py::TestExecutor::test_execute_tpch \
   tests/test_executor.py::TestExecutor::test_execute_tpcds
