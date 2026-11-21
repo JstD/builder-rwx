@@ -58,14 +58,18 @@ PRIOR = {
 
 # The one place a test may be dropped without having been run (BR_DROP=0 turns it off).
 # A few tests are so long that keeping one costs more than everything else on the
-# commit. When every cheaper candidate has run on the patched code and passed, the
-# change has shown no effect anywhere it could be looked at cheaply, and the long
-# tests are let go. BIG_SECONDS says what "long" is, DROP_CAP how much CPU the cheaper
-# ones may cost for the rule to apply, DROP_MIN_CHEAP how many of them there must be.
+# commit. When a code change has long tests among its candidates, the quick
+# candidates are run as evidence: at least DROP_MIN_CHEAP of them, each costing at
+# most EVIDENCE_CPU. Then, while the job stays within DROP_CAP CPU seconds, the
+# remaining ones under BIG_SECONDS are run too. If nothing fails, the long tests are
+# let go; anything else not run is kept. In the labeled practice commits a long test
+# never failed without a quick candidate failing as well.
 DROP = os.environ.get("BR_DROP", "1") == "1"
 BIG_SECONDS = float(os.environ.get("BR_BIG", "3.0"))
-DROP_CAP = float(os.environ.get("BR_DROP_CAP", "8.0"))
-DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "3"))
+EVIDENCE_CPU = float(os.environ.get("BR_EVIDENCE", "0.3"))
+LONG_CPU = float(os.environ.get("BR_LONG_CPU", "10.0"))  # a long test is one that also costs more than this to run; the rest are just run
+DROP_CAP = float(os.environ.get("BR_DROP_CAP", "6.0"))
+DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "5"))
 
 WARM = os.environ.get("BR_WARM", "1") == "1"  # start workers from a pre-imported sqlglot core
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
@@ -256,7 +260,7 @@ class Decision:
         self.runnable = True  # False when the patched tree cannot be built
         self.kinds: set[str] = set()
         self.notes: list[str] = []
-        self.drop_when_clean = False  # see DROP: set by plan()
+        self.drop_when_clean: set[int] = set()  # see DROP: long tests to let go, set by plan()
 
 
 def read_pinned(path: str) -> str | None:
@@ -389,16 +393,39 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
          setup_cost: dict[str, float]) -> list[int]:
     """The candidates worth running, in order. Empty means keep them all unrun."""
     candidates = sorted(decision.candidates)
-    decision.drop_when_clean = False
+    decision.drop_when_clean = set()
     if not candidates or not decision.runnable or decision.everything:
         return []
-    if DROP and any(seconds[n] >= BIG_SECONDS for n in candidates):
-        cheap = [n for n in candidates if seconds[n] < BIG_SECONDS]
-        classes = {tests[n]["id"].rsplit("::", 1)[0] for n in cheap}
-        total = sum(run_cost[n] for n in cheap) + sum(setup_cost.get(c, 0.0) for c in classes)
-        if len(cheap) >= DROP_MIN_CHEAP and total <= DROP_CAP:
-            decision.drop_when_clean = True
-            return sorted(cheap, key=lambda n: (run_cost[n], n))
+    if DROP and "data" not in decision.kinds:
+        long_tests = {n for n in candidates if seconds[n] >= BIG_SECONDS and run_cost[n] > LONG_CPU}
+        if long_tests:
+            def by_cost(n):
+                return (run_cost[n], n)
+
+            quick = sorted((n for n in candidates if n not in long_tests and run_cost[n] <= EVIDENCE_CPU), key=by_cost)
+            rest = sorted((n for n in candidates if n not in long_tests and run_cost[n] > EVIDENCE_CPU), key=by_cost)
+            seen_classes: set[str] = set()
+
+            def price(n):
+                key = tests[n]["id"].rsplit("::", 1)[0]
+                extra = 0.0 if key in seen_classes else setup_cost.get(key, 0.0)
+                seen_classes.add(key)
+                return run_cost[n] + extra
+
+            total = JOB_BASE + sum(price(n) for n in quick)
+            if len(quick) >= DROP_MIN_CHEAP and total <= DROP_CAP:
+                to_run = list(quick)
+                for n in rest:
+                    before = set(seen_classes)
+                    step = price(n)
+                    if total + step > DROP_CAP:
+                        seen_classes.clear()
+                        seen_classes.update(before)
+                        break
+                    total += step
+                    to_run.append(n)
+                decision.drop_when_clean = long_tests
+                return to_run
     p, q = 0.0, 0.0
     for kind in decision.kinds:
         kind_p, kind_q = PRIOR[kind]
@@ -613,9 +640,9 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                         decision = handle["decision"]
                         if (decision.drop_when_clean and not handle["failed"]
                                 and handle["ran"] == handle["planned"]):
-                            log(f"{decision.commit}: every cheaper candidate passed, letting go of "
-                                f"{len(answers[decision.commit])} long tests")
-                            answers[decision.commit] = set()
+                            log(f"{decision.commit}: the evidence passed, letting go of "
+                                f"{len(decision.drop_when_clean)} long tests")
+                            answers[decision.commit] -= decision.drop_when_clean
                         log(f"{handle['decision'].commit}: ran {handle['ran']}/{handle['planned']} in "
                             f"{time.monotonic() - handle['since']:.2f}s (expected {handle['expected']:.2f}s)")
                         runner.remove_overlay(handle["root"])

@@ -33,14 +33,16 @@ For each patch the selector does three things.
    tests are never run: CPU seconds cost as much as simulated seconds, and they
    need the most memory.
 
-4. **Lets the longest tests go when nothing cheaper shows an effect.** A handful
-   of tests take 3 s or more, and keeping one can cost more than everything else
-   on the commit. When they are among the candidates, and every cheaper candidate
-   (at least three, within 8 CPU seconds) has run on the patched code and passed,
-   the long ones are dropped unrun. This is the only place the selector accepts a
-   risk of missing a failure. Measured on 300 practice commits made on lines the
-   long tests execute: the rule dropped them 41 times, and a long test then failed
-   at most once (that one ran far over its time rather than giving a wrong result).
+4. **Lets the two longest tests go when the quick ones show no effect.** Two
+   tests cost more than 10 CPU seconds to run (the TPC-DS executor test and
+   `test_max_nodes`), and keeping one costs more than everything else on the
+   commit. When one is a candidate for a code change, the quick candidates are run
+   as evidence (at least five, 0.3 s each at most), then others while the job
+   stays within 6 CPU seconds. If nothing fails, the two long ones are dropped
+   unrun; anything else not run is kept. This is the only place the selector
+   accepts a risk of missing a failure. Measured on 514 practice commits made on
+   lines those tests execute: the evidence passed 85 times and a long test then
+   failed once (it ran far over its time rather than giving a wrong result).
    `BR_DROP=0` turns the rule off.
 
 Whatever is kept is split longest-first across the worker count that minimises
