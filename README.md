@@ -93,12 +93,12 @@ The TPC-DS executor test is run this way when its affected queries cost at most
 whole runs on practice commits: 656 trimmed runs of the mid-cost tests and 171
 of the TPC-DS test, every verdict the same. `BR_ITEMS=0` turns it off.
 
-One cost is shared between jobs. The executor's test class parses 32 CSV tables
-in its `setUpClass`, about a second of CPU in every job that runs one of its
-tests. The rows depend only on those files, so they are parsed once before the
-workers fork, and a job whose patch touches nothing under `tests/` builds the
-class from them; the rest of the setup runs as written, on the patched code
-(`harness.SharedTables`, checked equal to the real setup value by value).
+Every job runs in a worker forked from a slot, a process that already holds what
+the job needs: the third-party modules, and for most jobs sqlglot's unpatched
+core. The slots are forked at the very start, before any map is loaded, and
+come in four kinds (with or without the core, with or without duckdb and
+pandas), because a fork costs in proportion to the memory of the process being
+forked and each of the twenty or so jobs is one.
 
 Whatever is kept is split longest-first across the worker count that minimises
 busiest worker + 2 s per worker.

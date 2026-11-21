@@ -147,7 +147,6 @@ def _work(job: dict, out_fd: int):
             os.write(out_fd, b"P %d\n" % (1 if ok else 0))
             if not ok:
                 os._exit(0)
-        harness.SharedTables.enabled = bool(job.get("shared_tables"))
         delta = job.get("delta")
         if delta:
             # fixtures changed and no code: tests run only on what differs (harness.Items)
@@ -205,9 +204,9 @@ def _work(job: dict, out_fd: int):
         os._exit(0)
 
 
-def _serve(job_fd: int, out_fd: int, warm: str | None = None):
-    """The slot's loop: one job at a time, each in a forked worker."""
-    current = [0]
+def _setup(out_fd: int, heavy: bool, warm: str | None):
+    """Make a bare slot ready: load what its jobs will need, once."""
+    preload(heavy)
     if warm:
         # Import sqlglot's core once, from the pinned checkout, and say which files
         # that covered: a job that patches none of them can start from here.
@@ -230,6 +229,14 @@ def _serve(job_fd: int, out_fd: int, warm: str | None = None):
         os.write(out_fd, ("W " + json.dumps(sorted(files)) + "\n").encode("utf-8"))
         if not files:
             os._exit(0)
+    else:
+        os.write(out_fd, b"W []\n")
+
+
+def _serve(job_fd: int, out_fd: int):
+    """The slot's loop: a setup message first, then one job at a time, each in a
+    forked worker."""
+    current = [0]
 
     def kill_worker(*_):
         pid = current[0]
@@ -249,6 +256,9 @@ def _serve(job_fd: int, out_fd: int, warm: str | None = None):
     reader = os.fdopen(job_fd, "r", encoding="utf-8")
     for line in reader:
         job = json.loads(line)
+        if "setup" in job:
+            _setup(out_fd, bool(job["setup"].get("heavy")), job["setup"].get("warm"))
+            continue
         pid = os.fork()
         if pid == 0:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -270,11 +280,17 @@ def _serve(job_fd: int, out_fd: int, warm: str | None = None):
 
 
 class Slot:
-    """``warm`` is the pinned checkout to import sqlglot's core from, or None for a
-    slot whose workers import everything themselves."""
+    """A process that forks one worker per job. It is forked bare, while the selector
+    is still small, because a fork costs in proportion to the memory of the process
+    being forked and every job is one. ``setup`` then tells it what to load:
+    ``heavy`` for the third-party modules the optimizer and executor tests need, and
+    ``warm`` (the pinned checkout) to import sqlglot's core from it, so that jobs
+    which patch none of those files need not import it again."""
 
-    def __init__(self, warm: str | None = None):
-        self.warm = warm
+    def __init__(self):
+        self.warm: str | None = None
+        self.heavy = False
+        self.role = None  # the caller's label
         self.core: set[str] | None = None  # files of the modules a warm slot holds
         job_r, job_w = os.pipe()
         out_r, out_w = os.pipe()
@@ -285,7 +301,7 @@ class Slot:
             try:
                 # stdout belongs to the answers: nothing below this process may write to it
                 os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
-                _serve(job_r, out_w, warm)
+                _serve(job_r, out_w)
             finally:
                 os._exit(0)
         os.close(job_r)
@@ -294,6 +310,10 @@ class Slot:
         self.out_r = out_r
         self.buffer = b""
         self.job = None  # the caller's handle for the running job
+
+    def setup(self, heavy: bool, warm: str | None):
+        self.heavy, self.warm = heavy, warm
+        os.write(self.job_w, (json.dumps({"setup": {"heavy": heavy, "warm": warm}}) + "\n").encode("utf-8"))
 
     def submit(self, job: dict, handle):
         self.job = handle
