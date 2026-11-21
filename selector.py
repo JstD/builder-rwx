@@ -79,6 +79,7 @@ DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "5"))
 DELTA = os.environ.get("BR_DELTA", "1") == "1"
 DELTA_MIN = float(os.environ.get("BR_DELTA_MIN", "6.0"))
 DELTA_LONG_LIMIT = 15.0  # wall seconds for a test too long to run whole; past it, it is kept
+DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
 
 WARM = os.environ.get("BR_WARM", "1") == "1"  # start workers from a pre-imported sqlglot core
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
@@ -435,8 +436,9 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
         keep_all = approx_split(sum(seconds[n] for n in candidates), max(seconds[n] for n in candidates))
         if keep_all >= DELTA_MIN:
             decision.delta_run = True
-            return sorted(candidates, key=lambda n: (
-                setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0) > 0.5, run_cost[n], n))
+            # Longest first: in delta mode a long test costs little to run, and once
+            # one is known to fail the shorter ones may fit beside it for free.
+            return sorted(candidates, key=lambda n: (-seconds[n], n))
     if DROP and "data" not in decision.kinds:
         long_tests = {n for n in candidates if seconds[n] >= BIG_SECONDS and run_cost[n] > LONG_CPU}
         if long_tests:
@@ -633,7 +635,9 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                    "probe": decision.probe, "warm": slot.warm}
             if decision.delta_run:
                 job["delta"] = {"pinned": CHECKOUT, "files": decision.delta_files,
-                                "pool": str(MAPS / "pool_inputs.json")}
+                                "pool": str(MAPS / "pool_inputs.json"),
+                                "seconds": [seconds[n] for n in to_run],
+                                "cost": [min(run_cost[n], DELTA_ITEM_COST) for n in to_run]}
             slot.submit(job,
                         {"decision": decision, "root": root, "failed": False,
                          "probed": not decision.probe,

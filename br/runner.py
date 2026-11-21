@@ -158,10 +158,19 @@ def _work(job: dict, out_fd: int):
             harness.Items.delta_files = frozenset(delta["files"])
             harness.Items.delta_pinned = delta["pinned"]
         session = harness.Session()
-        for number, test_id, limit in job["tests"]:
+        weights = (delta or {}).get("seconds") or []
+        costs = (delta or {}).get("cost") or []
+        longest_failed = 0.0
+        for position, (number, test_id, limit) in enumerate(job["tests"]):
             ok = session.run(test_id, limit)
             os.write(out_fd, b"R %d %d\n" % (number, 1 if ok else 0))
             if not ok and job.get("stop", True):
+                break
+            if not ok and position < len(weights):
+                longest_failed = max(longest_failed, weights[position])
+            if longest_failed and sum(weights[position + 1:]) <= longest_failed and sum(costs[position + 1:]) > 1.5:
+                # What is left fits on one more worker beside the failing test, for
+                # 2 seconds; running it would cost more than that.
                 break
     except BaseException:
         pass
