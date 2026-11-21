@@ -1,0 +1,575 @@
+"""Blast Radius selector.
+
+For each patch against the pinned sqlglot commit:
+
+1. Work out which old source lines must execute for the change to matter
+   (``br.pydiff``), and look up which tests execute them in maps traced from the
+   pinned commit (``maps/``). Data files map to the tests that open them. That is
+   the candidate set: a test outside it cannot see the change.
+2. Run the cheap candidates on the patched tree (``br.runner``), cheapest first,
+   and stop at the first failure. A candidate is dropped only when it actually ran
+   and passed; everything not run is kept.
+3. Split what is kept across workers to minimise busiest worker + 2 s per worker.
+
+Anything unexpected falls back to keeping more tests, never fewer.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import select
+import sys
+import time
+import traceback
+from pathlib import Path
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from br import patch as patchlib  # noqa: E402
+from br import pydiff  # noqa: E402
+from br import readers as readerlib  # noqa: E402
+
+DATA = Path(os.environ.get("BR_DATA", "/data"))
+CHECKOUT = os.environ.get("BR_CHECKOUT", "/app/sqlglot")
+MAPS = Path(os.environ.get("BR_MAPS", os.path.join(HERE, "maps")))
+WORK = os.environ.get("BR_WORK", "/tmp/br")
+
+MAX_WORKERS = 8
+WORKER_COST = 2.0
+SLOTS = 2
+WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))  # seconds for the whole batch
+JOB_BASE = 0.3  # CPU seconds to fork a worker and import sqlglot
+SPEED = float(os.environ.get("BR_SPEED", "1.0"))  # our CPU seconds per traced CPU second
+
+# How likely a change of each kind is to break at least one candidate (p), and,
+# when it does, how likely each candidate is to be one of the broken (q). They
+# only steer how much is run before deciding; they never drop a test.
+PRIOR = {
+    "data": (0.9, 0.9),
+    pydiff.DEFERRED: (0.6, 0.4),
+    pydiff.IMMEDIATE: (0.35, 0.2),
+    pydiff.FILE: (0.9, 0.8),
+}
+
+CONFIG_FILES = {"conftest.py", "pytest.ini", "tox.ini"}
+CONFIG_HINTS = ("pytest", "addopts", "testpaths", "filterwarnings")
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+def expand(runs) -> set[int]:
+    out: set[int] = set()
+    for i in range(0, len(runs), 2):
+        out.update(range(runs[i], runs[i] + runs[i + 1]))
+    return out
+
+
+class Maps:
+    def __init__(self, directory: Path, tests: list[dict]):
+        self.directory = directory
+        self.index = json.loads((directory / "index.json").read_text())
+        self.cov: dict[str, dict | None] = {}
+        self.importers = None
+        self.tree = None  # ClassTree and readers.Finder, made on first need
+        self.finder = None
+        # the maps number tests as the pinned tests.json did; translate by id
+        by_id = {test["id"]: test["number"] for test in tests}
+        self.translate = [by_id.get(test_id) for test_id in self.index["ids"]]
+        known = set(self.index["ids"])
+        self.unknown = {test["number"] for test in tests if test["id"] not in known}
+        self.identity = all(i == n for i, n in enumerate(self.translate)) and not self.unknown
+
+    def tests(self, runs) -> set[int]:
+        numbers = expand(runs)
+        if self.identity:
+            return numbers
+        return {self.translate[n] for n in numbers if self.translate[n] is not None}
+
+    def file(self, path: str) -> dict | None:
+        if path not in self.cov:
+            target = self.directory / "cov" / (path.replace("/", "__") + ".json")
+            self.cov[path] = json.loads(target.read_text()) if target.exists() else None
+        return self.cov[path]
+
+    def lines(self, path: str, kind: str, start: int, end: int) -> set[int]:
+        data = self.file(path)
+        if data is None:
+            return set()
+        table = data[kind]  # "deferred", "immediate" or "runtime"
+        ids = {table[str(line)] for line in range(start, end + 1) if str(line) in table}
+        out: set[int] = set()
+        for set_id in ids:
+            out |= self.tests(data["sets"][set_id])
+        return out
+
+    def whole_file(self, path: str) -> set[int]:
+        data = self.file(path)
+        out: set[int] = set()
+        if data is not None:
+            for runs in data["sets"]:
+                out |= self.tests(runs)
+        return out
+
+    def probe_modules(self, paths: list[str]) -> list[str]:
+        # The patched modules and what imports them, as importable names.
+        if self.importers is None:
+            data = json.loads((self.directory / "classes.json").read_text())
+            self.importers = data.get("importers", {})
+        names: list[str] = []
+        for path in paths:
+            if not path.startswith(("sqlglot/", "tests/")):
+                continue
+            module = path[:-3].replace("/", ".")
+            if module.endswith(".__init__"):
+                module = module[: -len(".__init__")]
+            seen = [module]
+            for current in seen:
+                for importer in self.importers.get(current, ()):
+                    if importer not in seen and not importer.startswith("tests."):
+                        seen.append(importer)
+                if len(seen) > 40:
+                    break
+            # a module nearly everything imports: the package itself stands for the rest
+            names += seen if len(seen) <= 40 else [module, "sqlglot"]
+        return list(dict.fromkeys(names))
+
+    def readers(self, path: str) -> set[int]:
+        runs = self.index["opens"].get(path)
+        return self.tests(runs) if runs else set()
+
+    def listers(self, directory: str) -> set[int]:
+        runs = self.index["dirs"].get(directory)
+        return self.tests(runs) if runs else set()
+
+
+CLASS_ROOTS = {
+    "sqlglot.expressions.core:Expr",
+    "sqlglot.dialects.dialect:Dialect",
+    "sqlglot.tokens:Tokenizer",
+    "sqlglot.parser:Parser",
+    "sqlglot.generator:Generator",
+}
+
+
+class ClassTree:
+    """Which tests work with a class, for changes to a class body.
+
+    A class-level statement runs once at import, so line coverage only says who
+    imported the module. What narrows it is who then used the class: the traces
+    record the class of every object whose methods a test called. This is applied
+    only to the families whose state is reached through instances (expressions,
+    dialects and their tokenizers, parsers and generators).
+    """
+
+    def __init__(self, maps: "Maps"):
+        data = json.loads((maps.directory / "classes.json").read_text())
+        self.maps = maps
+        self.mro = data["mro"]
+        self.parts = data["parts"]
+        self.children: dict[str, set[str]] = {}
+        for cls, bases in self.mro.items():
+            for base in bases:
+                self.children.setdefault(base, set()).add(cls)
+        self.owners: dict[str, set[str]] = {}
+        for dialect, parts in self.parts.items():
+            for part in parts:
+                self.owners.setdefault(part, set()).add(dialect)
+
+    def descendants(self, cls: str) -> set[str]:
+        seen: set[str] = set()
+        stack = [cls]
+        while stack:
+            current = stack.pop()
+            if current not in seen:
+                seen.add(current)
+                stack.extend(self.children.get(current, ()))
+        return seen
+
+    def users(self, path: str, qualname: str) -> set[int] | None:
+        """Tests that used the class or anything built on it; None when unknown."""
+        module = path[:-3].replace("/", ".")
+        if module.endswith(".__init__"):
+            module = module[: -len(".__init__")]
+        cls = f"{module}:{qualname}"
+        if cls not in self.mro:
+            return None
+        if not (set(self.mro[cls]) | {cls}) & CLASS_ROOTS:
+            return None
+        related = self.descendants(cls)
+        for member in list(related):
+            # a tokenizer, parser or generator is also reached through its dialect
+            for dialect in self.owners.get(member, ()):
+                related |= self.descendants(dialect)
+            # and a dialect's settings are copied onto the parts made for it
+            for part in self.parts.get(member, ()):
+                if part not in CLASS_ROOTS and not part.startswith("sqlglot.dialects.dialect:"):
+                    related |= self.descendants(part)
+        types = self.maps.index["types"]
+        out: set[int] = set()
+        for member in related:
+            runs = types.get(member)
+            if runs:
+                out |= self.maps.tests(runs)
+        return out
+
+
+class Decision:
+    """What one commit needs: candidates, the files of its patched tree, a prior."""
+
+    def __init__(self, commit: str):
+        self.commit = commit
+        self.candidates: set[int] = set()
+        self.broad: set[int] = set()  # the candidates before any import-time narrowing
+        self.probe: list[str] = []  # modules that must still import for the narrowing to hold
+        self.everything = False  # could not analyse: keep every test
+        self.files: dict[str, str | None] = {}
+        self.runnable = True  # False when the patched tree cannot be built
+        self.kinds: set[str] = set()
+        self.notes: list[str] = []
+
+
+def read_pinned(path: str) -> str | None:
+    try:
+        with open(os.path.join(CHECKOUT, path), encoding="utf-8", newline="") as handle:
+            return handle.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def analyse(commit: str, text: str, maps: Maps) -> Decision:
+    decision = Decision(commit)
+    for file_patch in patchlib.parse(text):
+        old_path, new_path = file_patch.old_path, file_patch.new_path
+        if old_path is None and new_path is None:
+            decision.everything = True
+            continue
+        name = os.path.basename(new_path or old_path)
+        if name in CONFIG_FILES or (
+            name in ("pyproject.toml", "setup.cfg")
+            and any(hint in text for hint in CONFIG_HINTS)
+        ):
+            decision.everything = True
+            decision.notes.append(f"test configuration changed: {name}")
+            continue
+
+        if old_path != new_path:
+            # a file appearing or disappearing is visible to whoever lists its directory
+            for path in (old_path, new_path):
+                if path is not None:
+                    listers = maps.listers(os.path.dirname(path))
+                    if listers:
+                        decision.candidates |= listers
+                        decision.kinds.add("data")
+
+        old_text = read_pinned(old_path) if old_path is not None else None
+        try:
+            if old_path is not None and old_text is None:
+                raise patchlib.PatchError("pinned file missing or not text")
+            new_text, blocks = patchlib.apply(old_text, file_patch)
+        except patchlib.PatchError as error:
+            decision.notes.append(f"{old_path or new_path}: {error}")
+            decision.runnable = False
+            if old_path is not None and maps.readers(old_path):
+                decision.candidates |= maps.readers(old_path)
+                decision.kinds.add("data")
+            if (old_path or "").endswith(".py") or (new_path or "").endswith(".py"):
+                decision.everything = True
+            continue
+
+        if new_path is not None:
+            decision.files[new_path] = new_text
+        if old_path == new_path and new_text == old_text:
+            continue  # nothing in the file changed (a mode change, say)
+        if old_path is not None:
+            # tests that read the old file as data see any change to it
+            readers = maps.readers(old_path)
+            if readers:
+                decision.candidates |= readers
+                decision.kinds.add("data")
+        if old_path is not None and old_path != new_path:
+            decision.files[old_path] = None
+
+        if old_path is not None and old_path.endswith(".py"):
+            if maps.file(old_path) is None:
+                continue  # no test executes this file
+            renamed = new_text if old_path == new_path else None
+            for anchor in pydiff.diff(old_text, renamed, blocks):
+                decision.kinds.add(anchor.kind)
+                if anchor.kind == pydiff.FILE:
+                    found = maps.whole_file(old_path)
+                else:
+                    found = maps.lines(old_path, anchor.kind, anchor.start, anchor.end)
+                decision.broad |= found
+                if anchor.kind == pydiff.IMMEDIATE and found and (anchor.cls or anchor.names):
+                    # ran at import: narrow from "imported it" to "can read what it set"
+                    if maps.tree is None:
+                        maps.tree = ClassTree(maps)
+                        maps.finder = readerlib.Finder(CHECKOUT, maps, maps.tree)
+                    tree, finder = maps.tree, maps.finder
+                    reading = finder.find(old_path, anchor.cls, anchor.names)
+                    if reading is not None:
+                        found &= reading
+                    elif anchor.doc:
+                        found = set()  # a docstring is reachable only as __doc__, which nothing reads
+                    elif anchor.cls:  # no read found by name: fall back to who used the class
+                        users = tree.users(old_path, anchor.cls)
+                        if users is not None:
+                            found &= users
+                decision.candidates |= found
+                decision.notes.append(f"{old_path}: {anchor!r} -> {len(found)}")
+    decision.broad |= decision.candidates
+    if decision.broad != decision.candidates:
+        decision.probe = maps.probe_modules(
+            [path for path, new in decision.files.items() if new is not None and path.endswith(".py")]
+        )
+    if decision.candidates:
+        decision.candidates |= maps.unknown
+    if decision.broad:
+        decision.broad |= maps.unknown
+    return decision
+
+
+def approx_split(total: float, biggest: float) -> float:
+    if total <= 0:
+        return 0.0
+    return min(max(biggest, total / k) + WORKER_COST * k for k in range(1, MAX_WORKERS + 1))
+
+
+def split(tests: list[int], seconds: list[float]) -> list[list[int]]:
+    """Longest first onto the lightest worker, for the worker count that scores best."""
+    if not tests:
+        return []
+    ordered = sorted(tests, key=lambda n: -seconds[n])
+    best = None
+    for count in range(1, min(MAX_WORKERS, len(ordered)) + 1):
+        loads = [0.0] * count
+        workers: list[list[int]] = [[] for _ in range(count)]
+        for number in ordered:
+            lightest = loads.index(min(loads))
+            workers[lightest].append(number)
+            loads[lightest] += seconds[number]
+        cost = max(loads) + WORKER_COST * count
+        if best is None or cost < best[0] - 1e-9:
+            best = (cost, workers)
+    return best[1]
+
+
+def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
+         setup_cost: dict[str, float]) -> list[int]:
+    """The candidates worth running, in order. Empty means keep them all unrun."""
+    candidates = sorted(decision.candidates)
+    if not candidates or not decision.runnable or decision.everything:
+        return []
+    p, q = 0.0, 0.0
+    for kind in decision.kinds:
+        kind_p, kind_q = PRIOR[kind]
+        p = 1 - (1 - p) * (1 - kind_p)
+        q = max(q, kind_q)
+    if len(candidates) == 1:
+        q = 1.0
+
+    # the first test run from a class also pays for its setUpClass
+    cost = {n: run_cost[n] for n in candidates}
+    cheapest_in_class: dict[str, int] = {}
+    for n in candidates:
+        key = tests[n]["id"].rsplit("::", 1)[0]
+        if key in setup_cost and (key not in cheapest_in_class or cost[n] < cost[cheapest_in_class[key]]):
+            cheapest_in_class[key] = n
+    for key, n in cheapest_in_class.items():
+        cost[n] += setup_cost[key]
+    order = sorted(candidates, key=lambda n: (cost[n], n))
+
+    count = len(order)
+    suffix_total = [0.0] * (count + 1)
+    suffix_big = [0.0] * (count + 1)
+    for i in range(count - 1, -1, -1):
+        suffix_total[i] = suffix_total[i + 1] + seconds[order[i]]
+        suffix_big[i] = max(suffix_big[i + 1], seconds[order[i]])
+    keep_all = approx_split(suffix_total[0], suffix_big[0])
+
+    best_k, best_cost = 0, keep_all
+    spent = 0.0  # CPU to run the first k
+    until_failure = 0.0  # expected CPU before the first failure, if the change breaks tests
+    survive = 1.0
+    for k in range(1, count + 1):
+        step = cost[order[k - 1]]
+        spent += step
+        until_failure += step * survive
+        survive *= 1 - q
+        harmless = JOB_BASE + spent + approx_split(suffix_total[k], suffix_big[k])
+        harmful = JOB_BASE + until_failure + keep_all
+        expected = (1 - p) * harmless + p * harmful
+        if expected < best_cost - 1e-9:
+            best_k, best_cost = k, expected
+    return order[:best_k]
+
+
+def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], started: float):
+    seconds = [test["seconds"] for test in tests]
+    everything = set(range(len(tests)))
+    maps = Maps(MAPS, tests)
+    traced_cpu = maps.index["cpu"]
+    run_cost = list(seconds)
+    for map_number, number in enumerate(maps.translate):
+        if number is not None:
+            run_cost[number] = traced_cpu[map_number] * SPEED
+    setup_cost = {k: v * SPEED for k, v in maps.index["class_setup_cpu"].items()}
+
+    jobs = []
+    for path in patches:
+        commit = path.stem
+        try:
+            text = path.read_bytes().decode("utf-8", "surrogateescape")
+            decision = analyse(commit, text, maps)
+        except Exception:
+            log(f"{commit}: analysis failed\n{traceback.format_exc()}")
+            continue
+        if decision.everything:
+            log(f"{commit}: keeping every test ({'; '.join(decision.notes)})")
+            continue
+        answers[commit] = set(decision.candidates)
+        to_run = plan(decision, tests, seconds, run_cost, setup_cost)
+        log(f"{commit}: {len(decision.candidates)} candidates, running {len(to_run)} "
+            f"[{' '.join(sorted(decision.kinds))}] {'; '.join(decision.notes)}")
+        if to_run or decision.probe:
+            jobs.append((decision, to_run))
+
+    log(f"analysed {len(patches)} commits, {len(jobs)} to run: {sum(os.times()[:4]):.2f}s cpu so far")
+    if not jobs:
+        return
+
+    from br import runner
+
+    runner.preload()
+    log(f"preloaded: {sum(os.times()[:4]):.2f}s cpu so far")
+    os.makedirs(WORK, exist_ok=True)
+    slots = [runner.Slot() for _ in range(min(SLOTS, len(jobs)))]
+    queue = list(reversed(jobs))
+    running = 0
+    deadline = started + WALL_BUDGET
+
+    def start(slot):
+        nonlocal running
+        while queue:
+            decision, to_run = queue.pop()
+            root = os.path.join(WORK, decision.commit)
+            try:
+                runner.remove_overlay(root)
+                runner.build_overlay(CHECKOUT, root, decision.files)
+            except Exception:
+                log(f"{decision.commit}: overlay failed\n{traceback.format_exc()}")
+                continue
+            limits = [(n, tests[n]["id"], round(6 * run_cost[n] + 3.0, 2)) for n in to_run]
+            wall = min(sum(limit for _, _, limit in limits) + 10.0, max(5.0, deadline - time.monotonic()))
+            slot.submit({"root": root, "tests": limits, "stop": True, "wall": wall + 20.0,
+                         "probe": decision.probe},
+                        {"decision": decision, "root": root, "failed": False,
+                         "probed": not decision.probe,
+                         "since": time.monotonic(), "ran": 0, "planned": len(to_run),
+                         "expected": sum(run_cost[n] for n in to_run)})
+            running += 1
+            return
+
+    def widen(handle):
+        # a patched module no longer imports: every test that imports it is in play
+        decision = handle["decision"]
+        log(f"{decision.commit}: a patched module fails to import, keeping all {len(decision.broad)}")
+        answers[decision.commit] = set(decision.broad)
+        handle["failed"] = True
+        handle["probed"] = True
+
+    try:
+        for slot in slots:
+            start(slot)
+        while running:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                log("out of time: keeping every candidate not yet cleared")
+                break
+            ready, _, _ = select.select([s.out_r for s in slots if s.job is not None], [], [], timeout)
+            for slot in slots:
+                if slot.job is None or slot.out_r not in ready:
+                    continue
+                for event in slot.read():
+                    handle = slot.job
+                    if handle is None:
+                        break
+                    if event[0] == "R":
+                        _, number, ok = event
+                        handle["ran"] += 1
+                        if not ok:
+                            log(f"{handle['decision'].commit}: FAILED {tests[number]['id']}")
+                        if ok and not handle["failed"]:
+                            answers[handle["decision"].commit].discard(number)
+                        else:
+                            handle["failed"] = True
+                    elif event[0] == "P":
+                        handle["probed"] = True
+                        if not event[1]:
+                            widen(handle)
+                    else:
+                        if not handle["probed"]:
+                            widen(handle)  # the worker died before the imports finished
+                        log(f"{handle['decision'].commit}: ran {handle['ran']}/{handle['planned']} in "
+                            f"{time.monotonic() - handle['since']:.2f}s (expected {handle['expected']:.2f}s)")
+                        runner.remove_overlay(handle["root"])
+                        slot.job = None
+                        running -= 1
+                        start(slot)
+    finally:
+        for slot in slots:
+            slot.close()
+        try:
+            import shutil
+
+            shutil.rmtree(WORK, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def emit(patches, tests, answers) -> None:
+    seconds = [test["seconds"] for test in tests]
+    lines = []
+    for path in patches:
+        kept = sorted(answers[path.stem])
+        lines.append(json.dumps({"commit": path.stem, "workers": split(kept, seconds)},
+                                separators=(",", ":")))
+    sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+    sys.stdout.flush()
+
+
+def main() -> None:
+    started = time.monotonic()
+    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    patches = sorted((DATA / "commits").glob("*.patch"))
+    everything = set(range(len(tests)))
+    # every commit starts as "run everything"; analysis only ever narrows it
+    answers: dict[str, set[int]] = {path.stem: set(everything) for path in patches}
+
+    def last_resort(signum, frame):
+        # Something is stuck well past the budget. What has been cleared so far is
+        # still right, so answer with it and leave; the container ends with us.
+        log("hard timeout: answering with what is cleared so far")
+        emit(patches, tests, answers)
+        os._exit(0)
+
+    import signal
+
+    signal.signal(signal.SIGALRM, last_resort)
+    signal.setitimer(signal.ITIMER_REAL, WALL_BUDGET + 12.0)
+    try:
+        solve(patches, tests, answers, started)
+    except Exception:
+        log(f"selector failed, keeping what is safe\n{traceback.format_exc()}")
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    emit(patches, tests, answers)
+    log(f"answered {len(patches)} commits in {time.monotonic() - started:.1f}s wall, "
+        f"{sum(os.times()[:4]):.1f}s cpu")
+
+
+if __name__ == "__main__":
+    main()
