@@ -43,7 +43,7 @@ SLICED = os.environ.get("BR_SLICED", "1") == "1"  # parse only the changed state
 RUN = os.environ.get("BR_RUN", "1") == "1"  # 0: never run a test, answer from the maps alone
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))  # seconds for the whole batch
 JOB_BASE_LOCAL = 0.15  # CPU seconds to fork a worker and import what a test needs, as timed for the maps
-SPEED = float(os.environ.get("BR_SPEED", "2.0"))  # the scorer's CPU seconds per CPU second timed for the maps
+SPEED = float(os.environ.get("BR_SPEED", "1.0"))  # the scorer's CPU seconds per CPU second timed for the maps
 JOB_BASE = JOB_BASE_LOCAL * SPEED
 
 # How likely a change of each kind is to break at least one candidate (p), and,
