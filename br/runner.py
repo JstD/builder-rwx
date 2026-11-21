@@ -25,12 +25,12 @@ from br import harness
 PRELOAD = (
     "unittest", "unittest.mock", "decimal", "sqlite3", "csv", "gzip", "tempfile",
     "datetime", "concurrent.futures", "multiprocessing", "pickle", "logging",
-    "duckdb", "numpy", "pandas", "pandas.testing",
 )
+PRELOAD_HEAVY = ("duckdb", "numpy", "pandas", "pandas.testing")  # optimizer and executor tests
 
 
-def preload():
-    for name in PRELOAD:
+def preload(heavy: bool = True):
+    for name in PRELOAD + (PRELOAD_HEAVY if heavy else ()):
         try:
             __import__(name)
         except Exception as error:  # the tests that need it will fail and be kept
@@ -76,6 +76,45 @@ def remove_overlay(dest: str):
     shutil.rmtree(dest, ignore_errors=True)
 
 
+def _rebase(checkout: str, root: str):
+    """Make the already imported, unpatched sqlglot modules belong to the patched tree.
+
+    A warm slot imported sqlglot's core from the pinned checkout. None of those
+    modules is patched in this job, so their state is what a fresh import from the
+    patched tree would give. What still points at the pinned checkout is where they
+    say they live, and that decides where the modules not yet imported (the lazily
+    loaded dialects, the patched one among them) are looked for.
+    """
+    prefix = checkout.rstrip("/") + "/"
+
+    def move(path):
+        if isinstance(path, str) and path.startswith(prefix):
+            return root + "/" + path[len(prefix):]
+        return path
+
+    for name, module in list(sys.modules.items()):
+        if name != "sqlglot" and not name.startswith("sqlglot."):
+            continue
+        for attr in ("__file__", "__cached__"):
+            value = getattr(module, attr, None)
+            if value:
+                setattr(module, attr, move(value))
+        if hasattr(module, "__path__"):
+            module.__path__ = [move(path) for path in module.__path__]
+        spec = getattr(module, "__spec__", None)
+        if spec is not None:
+            if spec.origin:
+                spec.origin = move(spec.origin)
+            if spec.cached:
+                spec.cached = move(spec.cached)
+            if spec.submodule_search_locations is not None:
+                spec.submodule_search_locations = [move(path) for path in spec.submodule_search_locations]
+        loader = getattr(module, "__loader__", None)
+        if loader is not None and isinstance(getattr(loader, "path", None), str):
+            loader.path = move(loader.path)
+    sys.path[:] = [path for path in sys.path if path.rstrip("/") != checkout.rstrip("/")]
+
+
 def _work(job: dict, out_fd: int):
     """Runs in a forked worker; never returns."""
     try:
@@ -86,6 +125,8 @@ def _work(job: dict, out_fd: int):
         root = job["root"]
         os.environ["SKIP_INTEGRATION"] = "0"
         os.chdir(root)
+        if job.get("warm"):
+            _rebase(job["warm"], root)
         sys.path.insert(0, root)
         harness.install_alarm()
         probe = job.get("probe") or ()
@@ -118,9 +159,31 @@ def _work(job: dict, out_fd: int):
         os._exit(0)
 
 
-def _serve(job_fd: int, out_fd: int):
+def _serve(job_fd: int, out_fd: int, warm: str | None = None):
     """The slot's loop: one job at a time, each in a forked worker."""
     current = [0]
+    if warm:
+        # Import sqlglot's core once, from the pinned checkout, and say which files
+        # that covered: a job that patches none of them can start from here.
+        files: list[str] = []
+        try:
+            sys.path.insert(0, warm)
+            import sqlglot  # noqa: F401
+
+            prefix = warm.rstrip("/") + "/"
+            for name, module in list(sys.modules.items()):
+                path = getattr(module, "__file__", None)
+                if (name == "sqlglot" or name.startswith("sqlglot.")) and path and path.startswith(prefix):
+                    files.append(path[len(prefix):])
+            import gc
+
+            gc.collect()
+            gc.freeze()
+        except BaseException:
+            files = []
+        os.write(out_fd, ("W " + json.dumps(sorted(files)) + "\n").encode("utf-8"))
+        if not files:
+            os._exit(0)
 
     def kill_worker(*_):
         pid = current[0]
@@ -161,7 +224,12 @@ def _serve(job_fd: int, out_fd: int):
 
 
 class Slot:
-    def __init__(self):
+    """``warm`` is the pinned checkout to import sqlglot's core from, or None for a
+    slot whose workers import everything themselves."""
+
+    def __init__(self, warm: str | None = None):
+        self.warm = warm
+        self.core: set[str] | None = None  # files of the modules a warm slot holds
         job_r, job_w = os.pipe()
         out_r, out_w = os.pipe()
         self.pid = os.fork()
@@ -171,7 +239,7 @@ class Slot:
             try:
                 # stdout belongs to the answers: nothing below this process may write to it
                 os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
-                _serve(job_r, out_w)
+                _serve(job_r, out_w, warm)
             finally:
                 os._exit(0)
         os.close(job_r)
@@ -199,6 +267,9 @@ class Slot:
                 events.append(("R", int(parts[1]), parts[2] == b"1"))
             elif parts and parts[0] == b"P":
                 events.append(("P", parts[1] == b"1"))
+            elif parts and parts[0] == b"W":
+                self.core = set(json.loads(line[2:].decode("utf-8")))
+                events.append(("W",))
             elif parts and parts[0] == b"E":
                 events.append(("E",))
         return events

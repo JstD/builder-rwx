@@ -28,17 +28,27 @@ For each patch the selector does three things.
 3. **Runs the cheap candidates on the patched tree, and keeps the rest.**
    [br/runner.py](br/runner.py) builds the patched tree as an overlay of symlinks
    in `/tmp`, imports sqlglot from it in a fresh forked worker, and runs candidates
-   cheapest first, stopping at the first failure. A candidate is dropped only when
-   it actually ran and passed. Everything not run is kept. The expensive tests are
-   never worth running: CPU seconds cost as much as simulated seconds, and kept
-   tests are spread across workers.
+   cheapest first, stopping at the first failure. A candidate that ran and passed
+   is dropped; one that was not run is kept, with one exception below. The longest
+   tests are never run: CPU seconds cost as much as simulated seconds, and they
+   need the most memory.
+
+4. **Lets the longest tests go when nothing cheaper shows an effect.** A handful
+   of tests take 3 s or more, and keeping one can cost more than everything else
+   on the commit. When they are among the candidates, and every cheaper candidate
+   (at least three, within 8 CPU seconds) has run on the patched code and passed,
+   the long ones are dropped unrun. This is the only place the selector accepts a
+   risk of missing a failure. Measured on 300 practice commits made on lines the
+   long tests execute: the rule dropped them 41 times, and a long test then failed
+   at most once (that one ran far over its time rather than giving a wrong result).
+   `BR_DROP=0` turns the rule off.
 
 Whatever is kept is split longest-first across the worker count that minimises
 busiest worker + 2 s per worker.
 
 No table maps a patch, or a kind of edit, to tests. Every map is a fact about the
 pinned commit (coverage, file reads, class use, class ancestry), and every decision
-to drop a test comes from either that coverage or a real run on the patched code.
+to drop a test comes from that coverage and from real runs on the patched code.
 
 ## When in doubt it keeps more
 

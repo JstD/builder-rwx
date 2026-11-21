@@ -57,6 +57,15 @@ def one(tests_path, patch_path, out_path):
         for path in files:
             touched |= maps.whole_file(path) | maps.readers(path)
         skip = {t["number"] for t in tests if t["seconds"] > 5 and t["number"] not in touched}
+    if os.environ.get("BR_ONLY_CANDIDATES"):
+        # For studying which candidates fail together: the candidate sets themselves
+        # were checked against full-suite labels, so only they are run here.
+        import selector
+
+        maps = selector.Maps(selector.MAPS, tests)
+        decision = selector.analyse("label", text, maps)
+        if not decision.everything:
+            skip = {t["number"] for t in tests} - decision.candidates
     root = tempfile.mkdtemp(prefix="label-") + "/tree"
     runner.build_overlay(CHECKOUT, root, files)
     os.environ["SKIP_INTEGRATION"] = "0"

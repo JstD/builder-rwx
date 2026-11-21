@@ -14,7 +14,7 @@ docker run --rm --platform linux/amd64 --network none --cpus 2 \
   --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
   --volume "$DATA/commits:/data/commits:ro" \
   --volume "$DATA/tests.json:/data/tests.json:ro" \
-  "$IMAGE" > "$OUT" 2> "$OUT.log" || { tail -20 "$OUT.log"; exit 1; }
+  $RUN_ENV "$IMAGE" > "$OUT" 2> "$OUT.log" || { tail -20 "$OUT.log"; exit 1; }
 tail -1 "$OUT.log"
 python score.py "$DATA_ARG" "$DATA_ARG/answers.json" "$OUT" | head -3
 python tools/breakdown.py "$DATA_ARG" "$DATA_ARG/answers.json" "$OUT"

@@ -64,6 +64,9 @@ def play(tests, seconds, run_cost, setup, decision, failing):
             if number in failing:
                 break
             kept.discard(number)
+        else:
+            if decision.drop_when_clean:
+                kept = set()
     workers = selector.split(sorted(kept), seconds)
     cost = (max(sum(seconds[n] for n in w) for w in workers) + 2 * len(workers)) if workers else 0.0
     miss = 300.0 if failing - kept else 0.0

@@ -53,6 +53,21 @@ PRIOR = {
     pydiff.FILE: (0.9, 0.8),
 }
 
+# The one place a test may be dropped without having been run (BR_DROP=0 turns it off).
+# A few tests are so long that keeping one costs more than everything else on the
+# commit. When every cheaper candidate has run on the patched code and passed, the
+# change has shown no effect anywhere it could be looked at cheaply, and the long
+# tests are let go. BIG_SECONDS says what "long" is, DROP_CAP how much CPU the cheaper
+# ones may cost for the rule to apply, DROP_MIN_CHEAP how many of them there must be.
+DROP = os.environ.get("BR_DROP", "1") == "1"
+BIG_SECONDS = float(os.environ.get("BR_BIG", "3.0"))
+DROP_CAP = float(os.environ.get("BR_DROP_CAP", "8.0"))
+DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "3"))
+
+WARM = os.environ.get("BR_WARM", "0") == "1"  # start workers from a pre-imported sqlglot core (no gain measured)
+HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
+MAX_SINGLE_RUN = 10.0  # CPU seconds; two workers share 4 GB and the giants use over 1 GB
+
 CONFIG_FILES = {"conftest.py", "pytest.ini", "tox.ini"}
 CONFIG_HINTS = ("pytest", "addopts", "testpaths", "filterwarnings")
 
@@ -230,6 +245,7 @@ class Decision:
         self.runnable = True  # False when the patched tree cannot be built
         self.kinds: set[str] = set()
         self.notes: list[str] = []
+        self.drop_when_clean = False  # see DROP: set by plan()
 
 
 def read_pinned(path: str) -> str | None:
@@ -362,8 +378,16 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
          setup_cost: dict[str, float]) -> list[int]:
     """The candidates worth running, in order. Empty means keep them all unrun."""
     candidates = sorted(decision.candidates)
+    decision.drop_when_clean = False
     if not candidates or not decision.runnable or decision.everything:
         return []
+    if DROP and any(seconds[n] >= BIG_SECONDS for n in candidates):
+        cheap = [n for n in candidates if seconds[n] < BIG_SECONDS]
+        classes = {tests[n]["id"].rsplit("::", 1)[0] for n in cheap}
+        total = sum(run_cost[n] for n in cheap) + sum(setup_cost.get(c, 0.0) for c in classes)
+        if len(cheap) >= DROP_MIN_CHEAP and total <= DROP_CAP:
+            decision.drop_when_clean = True
+            return sorted(cheap, key=lambda n: (run_cost[n], n))
     p, q = 0.0, 0.0
     for kind in decision.kinds:
         kind_p, kind_q = PRIOR[kind]
@@ -397,6 +421,8 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
     survive = 1.0
     for k in range(1, count + 1):
         step = cost[order[k - 1]]
+        if step > MAX_SINGLE_RUN:
+            break  # the longest tests also need the most memory: they are kept, never run
         spent += step
         until_failure += step * survive
         survive *= 1 - q
@@ -444,16 +470,57 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
 
     from br import runner
 
-    runner.preload()
+    # duckdb and pandas are worth loading once only if more than one job needs them
+    heavy = sum(1 for _, to_run in jobs if any(tests[n]["file"] in HEAVY_FILES for n in to_run))
+    runner.preload(heavy=heavy >= 2)
     log(f"preloaded: {sum(os.times()[:4]):.2f}s cpu so far")
     os.makedirs(WORK, exist_ok=True)
-    slots = [runner.Slot() for _ in range(min(SLOTS, len(jobs)))]
-    queue = list(reversed(jobs))
+
+    # A warm slot has sqlglot's core imported already, from the pinned checkout. A
+    # job may start there when it patches none of the files that import covered,
+    # which is true of most dialect, parser and generator changes.
+    def patched_source(decision):
+        return [path for path in decision.files if path.startswith("sqlglot/")]
+
+    def could_be_warm(decision):
+        return all(path.endswith(".py") and decision.files[path] is not None
+                   for path in patched_source(decision))
+
+    hopeful = sum(1 for decision, _ in jobs if could_be_warm(decision))
+    warm_slots = []
+    if WARM and hopeful >= 2:
+        warm_slots = [runner.Slot(warm=CHECKOUT) for _ in range(2 if hopeful >= 8 else 1)]
+        waiting = list(warm_slots)
+        limit = time.monotonic() + 30.0
+        while waiting and time.monotonic() < limit:
+            ready, _, _ = select.select([s.out_r for s in waiting], [], [], 1.0)
+            for slot in list(waiting):
+                if slot.out_r in ready:
+                    events = slot.read()
+                    if slot.core is not None or ("E",) in events:
+                        waiting.remove(slot)
+        for slot in list(warm_slots):
+            if not slot.core:
+                slot.close()
+                warm_slots.remove(slot)
+    core = set.intersection(*(slot.core for slot in warm_slots)) if warm_slots else set()
+    warm_queue, cold_queue = [], []
+    for job in jobs:
+        decision = job[0]
+        if warm_slots and could_be_warm(decision) and not core.intersection(patched_source(decision)):
+            warm_queue.append(job)
+        else:
+            cold_queue.append(job)
+    warm_queue.reverse()
+    cold_queue.reverse()
+    slots = warm_slots + [runner.Slot() for _ in range(min(SLOTS, len(cold_queue)))]
+    log(f"{len(warm_queue)} jobs start warm, {len(cold_queue)} cold: {sum(os.times()[:4]):.2f}s cpu so far")
     running = 0
     deadline = started + WALL_BUDGET
 
     def start(slot):
         nonlocal running
+        queue = warm_queue if slot.warm else cold_queue
         while queue:
             decision, to_run = queue.pop()
             root = os.path.join(WORK, decision.commit)
@@ -466,7 +533,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             limits = [(n, tests[n]["id"], round(6 * run_cost[n] + 3.0, 2)) for n in to_run]
             wall = min(sum(limit for _, _, limit in limits) + 10.0, max(5.0, deadline - time.monotonic()))
             slot.submit({"root": root, "tests": limits, "stop": True, "wall": wall + 20.0,
-                         "probe": decision.probe},
+                         "probe": decision.probe, "warm": slot.warm},
                         {"decision": decision, "root": root, "failed": False,
                          "probed": not decision.probe,
                          "since": time.monotonic(), "ran": 0, "planned": len(to_run),
@@ -482,9 +549,13 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
         handle["failed"] = True
         handle["probed"] = True
 
-    try:
+    def pump():
         for slot in slots:
-            start(slot)
+            if slot.job is None and running < SLOTS:
+                start(slot)
+
+    try:
+        pump()
         while running:
             timeout = deadline - time.monotonic()
             if timeout <= 0:
@@ -514,12 +585,18 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                     else:
                         if not handle["probed"]:
                             widen(handle)  # the worker died before the imports finished
+                        decision = handle["decision"]
+                        if (decision.drop_when_clean and not handle["failed"]
+                                and handle["ran"] == handle["planned"]):
+                            log(f"{decision.commit}: every cheaper candidate passed, letting go of "
+                                f"{len(answers[decision.commit])} long tests")
+                            answers[decision.commit] = set()
                         log(f"{handle['decision'].commit}: ran {handle['ran']}/{handle['planned']} in "
                             f"{time.monotonic() - handle['since']:.2f}s (expected {handle['expected']:.2f}s)")
                         runner.remove_overlay(handle["root"])
                         slot.job = None
                         running -= 1
-                        start(slot)
+                        pump()
     finally:
         for slot in slots:
             slot.close()
