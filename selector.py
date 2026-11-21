@@ -94,7 +94,7 @@ DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
 # or more from its file: the guard passed 127 times and the long test still failed
 # in 5. TPC-DS, fewer than three: 40 times, 0 failed. test_max_nodes: 21 times, 0.
 GUARD = os.environ.get("BR_GUARD", "1") == "1"
-SPARE_SLOTS = 8  # worker slots forked at the start, while this process is still small
+SHARE_TABLES = os.environ.get("BR_SHARE_TABLES", "1") == "1"  # see harness.SharedTables
 
 # An exact answer for a long test that is one loop over independent items (the
 # executor's TPC-DS test and its 99 queries). maps/items.json says which items run
@@ -768,7 +768,7 @@ def _plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost:
     return order[:best_k]
 
 
-def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], started: float, spare: list):
+def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], started: float):
     seconds = [test["seconds"] for test in tests]
     everything = set(range(len(tests)))
     maps = Maps(MAPS, tests)
@@ -811,10 +811,31 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
 
     from br import runner
 
-    os.makedirs(WORK, exist_ok=True)
+    # duckdb and pandas are worth loading once only if more than one job needs them
+    heavy = sum(1 for _, to_run in jobs if any(tests[n]["file"] in HEAVY_FILES for n in to_run))
+    # The executor class's tables: parsed here once when at least two jobs would
+    # otherwise each parse them (see harness.SharedTables).
+    def shares_tables(decision, to_run):
+        # the tables come from CSV files and tests/helpers.py: an edited .sql fixture
+        # leaves them as they were, anything else under tests/ might not
+        def harmless(path):
+            return (not path.startswith("tests/")
+                    or (path.startswith("tests/fixtures/") and path.endswith(".sql")))
 
-    def needs_heavy(to_run):
-        return any(tests[n]["file"] in HEAVY_FILES for n in to_run)
+        return (SHARE_TABLES and all(harmless(path) for path in decision.files)
+                and any(tests[n]["file"] == harness.SharedTables.FILE for n in to_run))
+
+    from br import harness
+
+    if sum(1 for decision, to_run in jobs if shares_tables(decision, to_run)) >= 2:
+        try:
+            harness.SharedTables.parse(CHECKOUT)
+        except Exception:
+            harness.SharedTables.rows = None
+            log(f"tables not shared\n{traceback.format_exc()}")
+    runner.preload(heavy=heavy >= 2)
+    log(f"preloaded: {sum(os.times()[:4]):.2f}s cpu so far")
+    os.makedirs(WORK, exist_ok=True)
 
     # A warm slot has sqlglot's core imported already, from the pinned checkout. A
     # job may start there when it patches none of the files that import covered,
@@ -826,57 +847,41 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
         return all(path.endswith(".py") and decision.files[path] is not None
                    for path in patched_source(decision))
 
-    # Slots come in four kinds: with or without sqlglot's core (warm), and with or
-    # without duckdb and pandas (heavy). A job goes to the lightest kind it can use,
-    # because its worker is forked from the slot and pays for the slot's size.
-    by_role: dict[tuple[bool, bool], list] = {}
-
-    def make(role):
-        if not spare:
-            return None
-        slot = spare.pop()
-        slot.role = role
-        slot.setup(heavy=role[1], warm=CHECKOUT if role[0] else None)
-        by_role.setdefault(role, []).append(slot)
-        return slot
-
-    hopeful = [job for job in jobs if could_be_warm(job[0])]
-    core: set[str] = set()
-    if WARM and len(hopeful) >= 2:
-        role = (True, all(needs_heavy(to_run) for _, to_run in hopeful))
-        first = make(role)
+    hopeful = sum(1 for decision, _ in jobs if could_be_warm(decision))
+    warm_slots = []
+    if WARM and hopeful >= 2:
+        warm_slots = [runner.Slot(warm=CHECKOUT) for _ in range(2 if hopeful >= 8 else 1)]
+        waiting = list(warm_slots)
         limit = time.monotonic() + 30.0
-        while first is not None and first.core is None and time.monotonic() < limit:
-            ready, _, _ = select.select([first.out_r], [], [], 1.0)
-            if ready and ("E",) in first.read():
-                break
-        if first is not None and not first.core:
-            first.close()
-            by_role[role].remove(first)
-        elif first is not None:
-            core = first.core
-    queues: dict[tuple[bool, bool], list] = {}
+        while waiting and time.monotonic() < limit:
+            ready, _, _ = select.select([s.out_r for s in waiting], [], [], 1.0)
+            for slot in list(waiting):
+                if slot.out_r in ready:
+                    events = slot.read()
+                    if slot.core is not None or ("E",) in events:
+                        waiting.remove(slot)
+        for slot in list(warm_slots):
+            if not slot.core:
+                slot.close()
+                warm_slots.remove(slot)
+    core = set.intersection(*(slot.core for slot in warm_slots)) if warm_slots else set()
+    warm_queue, cold_queue = [], []
     for job in jobs:
-        decision, to_run = job
-        warm = bool(core) and could_be_warm(decision) and not core.intersection(patched_source(decision))
-        queues.setdefault((warm, needs_heavy(to_run)), []).append(job)
-    for role, queue in queues.items():
-        queue.reverse()
-        for _ in range((2 if len(queue) >= 8 else 1) - len(by_role.get(role, []))):
-            make(role)
-        if not by_role.get(role):
-            # no slot could be had: these jobs are not run, their candidates stay
-            log(f"no slot for {len(queue)} jobs")
-            queue.clear()
-    slots = [slot for group in by_role.values() for slot in group]
-    log(", ".join(f"{len(queue)} jobs {'warm' if role[0] else 'cold'}{' heavy' if role[1] else ''}"
-                  for role, queue in sorted(queues.items())) + f": {sum(os.times()[:4]):.2f}s cpu so far")
+        decision = job[0]
+        if warm_slots and could_be_warm(decision) and not core.intersection(patched_source(decision)):
+            warm_queue.append(job)
+        else:
+            cold_queue.append(job)
+    warm_queue.reverse()
+    cold_queue.reverse()
+    slots = warm_slots + [runner.Slot() for _ in range(min(SLOTS, len(cold_queue)))]
+    log(f"{len(warm_queue)} jobs start warm, {len(cold_queue)} cold: {sum(os.times()[:4]):.2f}s cpu so far")
     running = 0
     deadline = started + WALL_BUDGET
 
     def start(slot):
         nonlocal running
-        queue = queues.get(slot.role, [])
+        queue = warm_queue if slot.warm else cold_queue
         while queue:
             decision, to_run = queue.pop()
             root = os.path.join(WORK, decision.commit)
@@ -909,6 +914,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             wall = min(sum(entry[2] for entry in limits) + 10.0, max(5.0, deadline - time.monotonic()))
             job = {"root": root, "tests": limits, "stop": not decision.delta_run, "wall": wall + 20.0,
                    "probe": decision.probe, "warm": slot.warm,
+                   "shared_tables": harness.SharedTables.rows is not None and shares_tables(decision, to_run),
                    "pool": str(MAPS / "pool_inputs.json")}
             if decision.delta_run:
                 job["delta"] = {"pinned": CHECKOUT, "files": decision.delta_files,
@@ -962,8 +968,6 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                             handle["passed"].add(number)
                         else:
                             handle["failed"] = True
-                    elif event[0] == "W":
-                        continue  # a slot saying it is set up
                     elif event[0] == "P":
                         handle["probed"] = True
                         if not event[1]:
@@ -991,9 +995,6 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
     finally:
         for slot in slots:
             slot.close()
-        for slot in spare:
-            slot.close()
-        spare.clear()
         try:
             import shutil
 
@@ -1015,16 +1016,6 @@ def emit(patches, tests, answers) -> None:
 
 def main() -> None:
     started = time.monotonic()
-    # Fork the worker slots before anything is loaded: every job's worker is forked
-    # from a slot, and a fork costs in proportion to the memory of what is forked.
-    spare: list = []
-    if RUN and hasattr(os, "fork"):
-        try:
-            from br import runner
-
-            spare = [runner.Slot() for _ in range(SPARE_SLOTS)]
-        except Exception:
-            log(f"no worker slots\n{traceback.format_exc()}")
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     patches = sorted((DATA / "commits").glob("*.patch"))
     everything = set(range(len(tests)))
@@ -1045,11 +1036,9 @@ def main() -> None:
         signal.signal(signal.SIGALRM, last_resort)
         signal.setitimer(signal.ITIMER_REAL, WALL_BUDGET + 12.0)
     try:
-        solve(patches, tests, answers, started, spare)
+        solve(patches, tests, answers, started)
     except Exception:
         log(f"selector failed, keeping what is safe\n{traceback.format_exc()}")
-    for slot in spare:
-        slot.close()
     if timed:
         signal.setitimer(signal.ITIMER_REAL, 0)
     emit(patches, tests, answers)
