@@ -82,6 +82,7 @@ python /repo/tools/trace_all.py /repo/sample/tests.json /work/trace 10
 python /repo/tools/class_tree.py /work/classes.json
 python /repo/tools/compile_map.py /repo/sample/tests.json /work/trace /work/timing.json /repo/maps
 cp /work/classes.json /repo/maps/classes.json
+python /repo/tools/outline.py /app/sqlglot /repo/maps
 ```
 
 ## Trying it

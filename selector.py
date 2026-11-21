@@ -39,6 +39,7 @@ WORK = os.environ.get("BR_WORK", "/tmp/br")
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 SLOTS = 2
+SLICED = os.environ.get("BR_SLICED", "1") == "1"  # parse only the changed statements, via maps/outline.json
 RUN = os.environ.get("BR_RUN", "1") == "1"  # 0: never run a test, answer from the maps alone
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))  # seconds for the whole batch
 JOB_BASE = 0.3  # CPU seconds to fork a worker and import sqlglot
@@ -90,6 +91,7 @@ class Maps:
         self.index = json.loads((directory / "index.json").read_text())
         self.cov: dict[str, dict | None] = {}
         self.importers = None
+        self.outlines = None
         self.tree = None  # ClassTree and readers.Finder, made on first need
         self.finder = None
         # the maps number tests as the pinned tests.json did; translate by id
@@ -129,6 +131,13 @@ class Maps:
             for runs in data["sets"]:
                 out |= self.tests(runs)
         return out
+
+    def outline(self, path: str) -> dict | None:
+        """Where the module- and class-level statements of a pinned file are."""
+        if self.outlines is None:
+            target = self.directory / "outline.json"
+            self.outlines = json.loads(target.read_text()) if SLICED and target.exists() else {}
+        return self.outlines.get(path)
 
     def probe_modules(self, paths: list[str]) -> list[str]:
         # The patched modules and what imports them, as importable names.
@@ -314,7 +323,7 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
             if maps.file(old_path) is None:
                 continue  # no test executes this file
             renamed = new_text if old_path == new_path else None
-            for anchor in pydiff.diff(old_text, renamed, blocks):
+            for anchor in pydiff.diff(old_text, renamed, blocks, maps.outline(old_path)):
                 decision.kinds.add(anchor.kind)
                 if anchor.kind == pydiff.FILE:
                     found = maps.whole_file(old_path)

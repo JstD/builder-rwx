@@ -327,10 +327,120 @@ def _changes_inside_lambdas(old, new):
     return found if same_or_in_lambda(old, new) and found else None
 
 
-def diff(old_source: str, new_source: str | None, blocks) -> list[Anchor]:
-    """Anchors for one changed Python file. An empty list means no code changed."""
+class _Stand:
+    """Stands in for a class statement that was not parsed: just its lines."""
+
+    def __init__(self, first: int, lineno: int, last: int):
+        self.lineno = lineno
+        self.end_lineno = last
+        self.decorator_list = [_Stand(first, first, first)] if first < lineno else []
+
+
+def _is_blank(line: str) -> bool:
+    stripped = line.strip()
+    return not stripped or stripped.startswith("#")
+
+
+def _cut(lines, start: int, end: int, indent: int, head: bool):
+    """Parse lines start..end on their own and give the statements their real line
+    numbers. None when they do not stand alone as code."""
+    text = "\n".join(lines[start - 1:end]) + "\n"
+    if head:
+        text += " " * (indent + 4) + "pass\n"
+    offset = start - 1
+    if indent:
+        text = "if 1:\n" + text
+        offset -= 1
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    roots = tree.body[0].body if indent else tree.body
+    for root in roots:
+        ast.increment_lineno(root, offset)
+    return roots
+
+
+def _diff_sliced(old_source: str, new_source: str, blocks, outline) -> list[Anchor] | None:
+    """The same anchors as the whole-file comparison, from parsing only the changed
+    statements. ``outline`` gives the line span of every module- and class-level
+    statement of the old file. None whenever the change is not plainly inside such
+    statements (something added between them, a statement split or merged): the
+    whole-file comparison then decides."""
+    units = outline["units"]
+    old_lines = old_source.split("\n")
+    new_lines = new_source.split("\n")
+    heads = {unit[4].split("|")[1]: unit for unit in units if unit[3] == "head"}
+
+    def unit_at(first: int, last: int, point: bool):
+        for unit in units:
+            if unit[0] > last:
+                break
+            if point:
+                if unit[0] < first <= unit[1]:
+                    return unit
+            elif unit[0] <= first and last <= unit[1]:
+                return unit
+        return None
+
+    touched: list[tuple[list, int, int]] = []  # unit, line shift before it, line shift after it
+    delta = 0
+    for start, end, added in blocks:
+        new_start = start + delta
+        unit = unit_at(start, start if start == end else end - 1, start == end)
+        if unit is None:
+            # between statements: only blank and comment lines may come or go there
+            if not all(_is_blank(line) for line in old_lines[start - 1:end - 1]):
+                return None
+            if not all(_is_blank(line) for line in new_lines[new_start - 1:new_start - 1 + added]):
+                return None
+            inside = [u for u in units if u[0] <= end - 1 and u[1] >= start] if start != end else []
+            if inside:
+                return None  # the block reaches into a statement as well
+        elif touched and touched[-1][0] is unit:
+            touched[-1] = (unit, touched[-1][1], delta + added - (end - start))
+        else:
+            touched.append((unit, delta, delta + added - (end - start)))
+        delta += added - (end - start)
+
+    differ = _Differ(blocks)
+    for unit, before, after in touched:
+        start, end, indent, kind, chain = unit[:5]
+        head = kind == "head"
+        old_roots = _cut(old_lines, start, end, indent, head)
+        new_roots = _cut(new_lines, start + before, end + after, indent, head)
+        if old_roots is None or new_roots is None or len(old_roots) != 1 or len(new_roots) != 1:
+            return None
+        old, new = old_roots[0], new_roots[0]
+        if type(old) is not type(new):
+            return None
+        outer = chain.split("|")[0] if head else chain
+        if outer:
+            owner = heads.get(outer)
+            if owner is None:
+                return None
+            scope = ("class", outer, _Stand(owner[0], owner[7], owner[6]))
+        else:
+            scope = ("module", None)
+        if head:
+            differ.klass(old, new, scope)
+        else:
+            differ.statement(old, new, scope, [old] if unit[5] else [None, old])
+    return differ.anchors
+
+
+def diff(old_source: str, new_source: str | None, blocks, outline=None) -> list[Anchor]:
+    """Anchors for one changed Python file. An empty list means no code changed.
+    ``outline`` (see tools/outline.py) lets the common case skip parsing the file."""
     if new_source is None:
         return [Anchor(FILE)]
+    if outline is not None:
+        try:
+            anchors = _diff_sliced(old_source, new_source, blocks, outline)
+        except Exception:
+            anchors = None
+        if anchors is not None:
+            return anchors
     try:
         new_tree = ast.parse(new_source)
     except (SyntaxError, ValueError, RecursionError):

@@ -20,12 +20,14 @@ on objects of the changed class is bounded by the tests that used that class.
 from __future__ import annotations
 
 import ast
+import bisect
 import os
 import re
 
 MAX_ELEMENTS = 40
 MAX_DEPTH = 4
 MAX_PARSE_BYTES = 2_500_000
+SLICED = os.environ.get("BR_SLICED", "1") == "1"  # parse only the statements needed
 
 _FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
 _SELF = ("self", "cls")
@@ -161,6 +163,99 @@ class _File:
         return False
 
 
+class _Sliced(_File):
+    """The same lookups without parsing the whole file.
+
+    ``outline`` (maps/outline.json, from the pinned commit) says which lines each
+    module- and class-level statement spans. Only the statements on lines that
+    mention the name are cut out and parsed, then given their real line numbers.
+    """
+
+    def __init__(self, path: str, text: str, outline: dict):
+        self.path = path
+        self.lines = text.split("\n")
+        self.units = outline["units"]
+        self.starts = [unit[0] for unit in self.units]
+        self.star_import = outline["star"]
+        self.parents: dict[ast.AST, ast.AST] = {}
+        self.found: dict[str, list[ast.AST]] = {}
+        self.by_name: dict[tuple[int, int], dict[str, list[ast.AST]]] = {}
+        self.chain: dict[ast.AST, str] = {}  # top statement of a unit -> classes around it
+
+    def mentions(self, name: str, pattern) -> list[ast.AST]:
+        if name not in self.found:
+            spans: list[tuple[int, int]] = []
+            for number, line in enumerate(self.lines, 1):
+                if name in line and pattern.search(line):
+                    index = bisect.bisect_right(self.starts, number) - 1
+                    if index < 0:
+                        continue
+                    # statements can share a start line (``a = 1; b = 2``)
+                    first = self.units[index][0]
+                    while index >= 0 and self.units[index][0] == first:
+                        unit = self.units[index]
+                        if unit[0] <= number <= unit[1]:
+                            span = (unit[0], unit[1])
+                            if span not in spans:
+                                spans.append(span)
+                                self._parse(unit)
+                        index -= 1
+            out: list[ast.AST] = []
+            for span in sorted(spans):
+                out.extend(self.by_name[span].get(name, ()))
+            self.found[name] = out
+        return self.found[name]
+
+    def _parse(self, unit):
+        start, end, indent, kind, chain = unit[:5]
+        span = (start, end)
+        if span in self.by_name:
+            return
+        text = "\n".join(self.lines[start - 1:end]) + "\n"
+        if kind == "head":
+            text += " " * (indent + 4) + "pass\n"
+            chain = chain.split("|")[0]
+        offset = start - 1
+        if indent:
+            text = "if 1:\n" + text
+            offset -= 1
+        tree = ast.parse(text)
+        roots = tree.body[0].body if indent else tree.body
+        index: dict[str, list[ast.AST]] = {}
+        parents = self.parents
+        for root in roots:
+            ast.increment_lineno(root, offset)
+            self.chain[root] = chain
+            stack = [root]
+            while stack:
+                current = stack.pop()
+                if isinstance(current, ast.Name):
+                    index.setdefault(current.id, []).append(current)
+                elif isinstance(current, ast.Attribute):
+                    index.setdefault(current.attr, []).append(current)
+                elif isinstance(current, ast.Constant):
+                    if isinstance(current.value, str):
+                        index.setdefault(current.value, []).append(current)
+                elif isinstance(current, ast.alias):
+                    index.setdefault(current.name, []).append(current)
+                for child in ast.iter_child_nodes(current):
+                    parents[child] = current
+                    stack.append(child)
+        self.by_name[span] = index
+
+    def place(self, node):
+        function, classes, statement = super().place(node)
+        top = node
+        while top in self.parents:
+            top = self.parents[top]
+        outer = self.chain.get(top, "")
+        if outer and classes:
+            classes = f"{outer}.{classes}"
+        elif outer:
+            classes = outer
+        return function, classes, statement
+
+
 def _targets(statement) -> tuple[list[str], list[str]]:
     """(plain names, attribute names) a statement binds."""
     names: list[str] = []
@@ -234,8 +329,12 @@ class Finder:
 
     def _file(self, path: str) -> _File | None:
         if path not in self.files:
+            outline = self.maps.outline(path) if SLICED else None
             try:
-                self.files[path] = _File(path, self._text(path))
+                if outline is not None:
+                    self.files[path] = _Sliced(path, self._text(path), outline)
+                else:
+                    self.files[path] = _File(path, self._text(path))
             except (SyntaxError, ValueError, RecursionError):
                 self.files[path] = None
         return self.files[path]
