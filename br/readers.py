@@ -28,6 +28,7 @@ MAX_ELEMENTS = 40
 MAX_DEPTH = 4
 MAX_PARSE_BYTES = 2_500_000
 SLICED = os.environ.get("BR_SLICED", "1") == "1"  # parse only the statements needed
+LOCALS = os.environ.get("BR_LOCALS", "1") == "1"  # follow a value into a local variable
 
 _FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
 _SELF = ("self", "cls")
@@ -287,6 +288,55 @@ def _span(statement) -> tuple[int, int]:
     return statement.lineno, statement.end_lineno
 
 
+def _local_reads(function, name: str, binding) -> list[tuple[int, int]] | None:
+    """Line spans of the statements in ``function`` that read its local ``name``,
+    other than the statement ``binding`` that set it. None when the name is not
+    simply a local there (declared global or nonlocal, or bound in a nested scope
+    where a read cannot be told apart)."""
+    spans: list[tuple[int, int]] = []
+    stack: list[tuple[ast.AST, ast.AST | None, ast.AST | None]] = [(s, None, None) for s in function.body]
+    while stack:
+        node, statement, lam = stack.pop()
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            if name in node.names:
+                return None
+            continue
+        if isinstance(node, ast.stmt):
+            statement, lam = node, None
+        if isinstance(node, ast.Name) and node.id == name and statement is not binding:
+            reads = isinstance(node.ctx, ast.Load) or isinstance(statement, ast.AugAssign)
+            if reads and statement is not None:
+                if lam is not None:
+                    spans.append((lam.body.lineno, lam.body.end_lineno))
+                else:
+                    spans.append(_span(statement))
+        if isinstance(node, ast.Lambda):
+            for child in ast.iter_child_nodes(node.args):
+                stack.append((child, statement, lam))
+            stack.append((node.body, statement, node))
+            continue
+        if isinstance(node, (*_FUNCS, ast.ClassDef, ast.If, ast.For, ast.AsyncFor, ast.While, ast.With,
+                             ast.AsyncWith, ast.Try, ast.TryStar, ast.Match)):
+            # a compound statement: its header belongs to it, its blocks to their own statements
+            for field, value in ast.iter_fields(node):
+                for item in value if isinstance(value, list) else [value]:
+                    if isinstance(item, ast.stmt):
+                        stack.append((item, None, None))
+                    elif isinstance(item, (ast.ExceptHandler, ast.match_case)):
+                        for sub_field, sub_value in ast.iter_fields(item):
+                            for sub in sub_value if isinstance(sub_value, list) else [sub_value]:
+                                if isinstance(sub, ast.stmt):
+                                    stack.append((sub, None, None))
+                                elif isinstance(sub, ast.AST):
+                                    stack.append((sub, statement, lam))
+                    elif isinstance(item, ast.AST):
+                        stack.append((item, statement, lam))
+            continue
+        for child in ast.iter_child_nodes(node):
+            stack.append((child, statement, lam))
+    return spans
+
+
 def _tail(node) -> str | None:
     """The last identifier of an attribute's receiver: ``MySQLParser`` in
     ``mysql.MySQLParser.SHOW_PARSERS``."""
@@ -362,6 +412,9 @@ class Finder:
         self.memo: dict[tuple, set[int] | None] = {}
         self.parsed_bytes = 0
         self.mentions = 0
+        # files that read the value while they are being imported: if the read now
+        # raises, the whole module is gone, not just what it would have bound
+        self.import_reads: set[str] = set()
         result: set[int] = set()
         for name in names:
             # An element is one place the value lives:
@@ -448,6 +501,7 @@ class Finder:
             if parent.level == 0 and source != module:
                 return None
             # the importing module now has its own global holding the value
+            self.import_reads.add(path)
             cover = self.maps.lines(path, "immediate", parent.lineno, parent.end_lineno)
             return cover, [("global", path, node.asname or node.name, None)]
 
@@ -486,9 +540,11 @@ class Finder:
             return None
 
         if statement is None:
+            self.import_reads.add(path)
             return self.maps.whole_file(path), []
 
         if function is None:
+            self.import_reads.add(path)
             # Evaluated while a module or class body runs, in every process that
             # imports it: whatever the statement binds now depends on the value.
             start, end = _span(statement)
@@ -511,11 +567,21 @@ class Finder:
             names, attrs = _targets(parent)
             if attrs and not names:
                 return cover, [("attr", None, a, scope) for a in attrs]
+            if LOCALS and len(names) == 1 and not attrs and not isinstance(function, ast.Lambda):
+                # Kept in a local variable: it matters only to a test that goes on to
+                # run a statement of this function that reads the variable.
+                spans = _local_reads(function, names[0], parent)
+                if spans is not None:
+                    onward: set[int] = set()
+                    for first, last in spans:
+                        onward |= self.maps.lines(path, "deferred", first, last)
+                    return cover & onward, []
         elif isinstance(parent, ast.keyword) and parent.value is node and parent.arg:
             return cover, [("param", None, parent.arg, scope), ("attr", None, parent.arg, scope)]
         elif cover and not self.maps.lines(path, "runtime", start, end):
             # Only ever runs while modules are imported (class construction): what it
             # stores is where the value went.
+            self.import_reads.add(path)
             names, attrs = _targets(statement)
             if attrs and not names and isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 return cover, [("attr", None, a, scope) for a in attrs]

@@ -14,7 +14,11 @@ For each patch the selector does three things.
    a test that runs that statement. A change to a module or class body takes effect
    at import, so it matters to tests that import the module and can read what the
    statement binds. A comment or formatting change leaves the tree equal and has no
-   lines at all.
+   lines at all. A statement that was removed is anchored by itself: a removed
+   line of a function matters to the tests that ran it, a removed method to the
+   tests that ran its body, a removed constant to the tests that read its name.
+   An added statement matters where control used to pass that point. When an edit
+   changes which names are local to a function, the whole function counts.
 
 2. **Looks up which tests execute those lines.** The maps in [maps/](maps) were
    traced from the pinned commit: every test was run alone in a fresh process, with
@@ -23,7 +27,8 @@ For each patch the selector does three things.
    whose methods it called. A test that never executes an anchor line is not a
    candidate. Data files (the `.sql` fixtures) map to the tests that open them.
    For class-level constants, [br/readers.py](br/readers.py) follows the bound name
-   through the source to the lines that read it.
+   through the source to the lines that read it, including through attributes,
+   keyword arguments and local variables it is handed to unchanged.
 
 3. **Runs the cheap candidates on the patched tree, and keeps the rest.**
    [br/runner.py](br/runner.py) builds the patched tree as an overlay of symlinks
@@ -55,6 +60,9 @@ to drop a test comes from that coverage and from real runs on the patched code.
 ## When in doubt it keeps more
 
 - A patch that cannot be parsed or applied keeps every test.
+- A change narrowed to the readers of a name is checked by importing the patched
+  module and every module that reads the name while loading; if one no longer
+  imports, every test that imports the patched module is kept.
 - A Python file whose new text has a syntax error, or whose statement structure
   cannot be paired, widens to the enclosing statement, function or file.
 - A change to pytest configuration keeps every test.
@@ -96,4 +104,7 @@ python tools/breakdown.py sample sample/answers.json output.jsonl
 
 `tools/mutate.py`, `tools/label.py` and `tools/evaluate.py` make practice commits,
 label them by running the whole suite on each, and check that every failing test
-is among the selector's candidates.
+is among the selector's candidates. `tools/newkinds.py` makes the kinds the sample
+does not have: statements removed or added, import edits, changed signatures,
+whole functions removed, test helpers, non-code files, files added, removed or
+renamed, and several files in one commit.

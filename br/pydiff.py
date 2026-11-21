@@ -17,6 +17,10 @@ removed, re-nested), the anchor widens to the smallest enclosing statement or sc
 from __future__ import annotations
 
 import ast
+import difflib
+import os
+
+ALIGN = os.environ.get("BR_ALIGN", "1") == "1"  # pair statements around ones added or removed
 
 DEFERRED = "deferred"
 IMMEDIATE = "immediate"
@@ -26,20 +30,25 @@ _COMPOUND_BLOCKS = ("body", "orelse", "finalbody")
 
 
 class Anchor:
-    __slots__ = ("kind", "start", "end", "cls", "names", "doc")
+    __slots__ = ("kind", "start", "end", "cls", "names", "doc", "probe")
 
-    def __init__(self, kind, start=0, end=0, cls=None, names=(), doc=False):
+    def __init__(self, kind, start=0, end=0, cls=None, names=(), doc=False, probe=False):
         self.kind = kind
         self.start = start  # inclusive
         self.end = end  # inclusive
         self.cls = cls  # dotted qualname of the enclosing class, for immediate anchors
         self.names = tuple(names)  # names the changed statement binds
         self.doc = doc  # the change is to a docstring
+        # True: whoever ran these lines is affected only if the patched module no
+        # longer imports (a name used while it loads is gone), which is checked by
+        # importing it
+        self.probe = probe
 
     def __repr__(self):
         extra = f" cls={self.cls}" if self.cls else ""
         extra += f" names={list(self.names)}" if self.names else ""
         extra += " doc" if self.doc else ""
+        extra += " probe" if self.probe else ""
         return f"<{self.kind} {self.start}-{self.end}{extra}>"
 
 
@@ -61,6 +70,85 @@ def _is_string(statement) -> bool:
         and isinstance(statement.value, ast.Constant)
         and isinstance(statement.value.value, str)
     )
+
+
+_TRACED = (
+    ast.Assign, ast.AugAssign, ast.Return, ast.Raise, ast.If, ast.For, ast.AsyncFor, ast.While,
+    ast.With, ast.AsyncWith, ast.Try, ast.TryStar, ast.Delete, ast.Import, ast.ImportFrom,
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assert, ast.Match,
+)
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_BINDERS = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Import, ast.ImportFrom)
+
+
+def _traced(statement) -> bool:
+    """Reaching the statement always leaves one of its lines in a trace."""
+    if isinstance(statement, ast.Expr):
+        return not isinstance(statement.value, ast.Constant)
+    if isinstance(statement, ast.AnnAssign):
+        return statement.value is not None
+    return isinstance(statement, _TRACED)
+
+
+def _inert(statement) -> bool:
+    """Compiles to nothing that can fail or be seen."""
+    return _is_string(statement) or isinstance(statement, ast.Pass)
+
+
+def _scoping(function):
+    """What decides, at compile time, how the names in a function resolve and what
+    kind of function it is: the names its own body binds, the ones it declares
+    global or nonlocal, and whether it yields or awaits."""
+    args = function.args
+    bound: set[str] = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+    bound.update(a.arg for a in (args.vararg, args.kwarg) if a is not None)
+    declared: set[tuple[str, str]] = set()
+    flags: set[str] = set()
+    stack = list(function.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (*_DEFS, ast.ClassDef)):
+            bound.add(node.name)
+            # its decorators, defaults and bases are evaluated here; its body is not ours
+            stack.extend(node.decorator_list)
+            if isinstance(node, ast.ClassDef):
+                stack.extend(node.bases)
+                stack.extend(k.value for k in node.keywords)
+            else:
+                stack.extend(d for d in node.args.defaults + node.args.kw_defaults if d is not None)
+            continue
+        if isinstance(node, ast.Lambda):
+            stack.extend(d for d in node.args.defaults + node.args.kw_defaults if d is not None)
+            # a walrus inside still binds in the enclosing function
+            stack.extend(n for n in ast.walk(node.body) if isinstance(n, ast.NamedExpr))
+            continue
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.NamedExpr) and isinstance(inner.target, ast.Name):
+                    bound.add(inner.target.id)
+                elif isinstance(inner, (ast.Yield, ast.YieldFrom, ast.Await)):
+                    flags.add(type(inner).__name__)
+            continue
+        if isinstance(node, ast.Name):
+            if not isinstance(node.ctx, ast.Load):
+                bound.add(node.id)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            declared.update((type(node).__name__, name) for name in node.names)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                bound.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                bound.add(node.rest)
+        elif isinstance(node, (ast.Yield, ast.YieldFrom, ast.Await, ast.AsyncFor, ast.AsyncWith)):
+            flags.add(type(node).__name__)
+        stack.extend(ast.iter_child_nodes(node))
+    return bound, declared, flags
 
 
 class _Differ:
@@ -137,6 +225,11 @@ class _Differ:
                         first = old_stmts[0]
                         self.anchors.append(Anchor(IMMEDIATE, _first_line(first), first.end_lineno,
                                                    names=("__doc__",), doc=True))
+                    elif scope[0] == "func":
+                        # a function's docstring: no line of it ever runs
+                        self.anchors.append(Anchor(DEFERRED, 0, 0, doc=True))
+                    return
+                if ALIGN and self.align(old_stmts, new_stmts, old_dumps, new_dumps, scope):
                     return
                 self.widen(scope, owner)
                 if scope[0] == "class":
@@ -149,6 +242,140 @@ class _Differ:
             return
         for old, new in zip(old_touched, new_touched):
             self.statement(old, new, scope, old_stmts)
+
+    def align(self, old_stmts, new_stmts, old_dumps, new_dumps, scope) -> bool:
+        """Statements came or went in this block. Pair the ones that stayed, compare
+        the ones that changed in place, and anchor each one that was removed or
+        added by itself. False when some part of that is not understood, and the
+        caller then anchors the whole scope."""
+        low = 0
+        while low < len(old_dumps) and low < len(new_dumps) and old_dumps[low] == new_dumps[low]:
+            low += 1
+        high_old, high_new = len(old_dumps), len(new_dumps)
+        while high_old > low and high_new > low and old_dumps[high_old - 1] == new_dumps[high_new - 1]:
+            high_old -= 1
+            high_new -= 1
+        matcher = difflib.SequenceMatcher(None, old_dumps[low:high_old], new_dumps[low:high_new], autojunk=False)
+        pending: list[Anchor] = []
+        pairs = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            gone = old_stmts[low + i1:low + i2]
+            came = new_stmts[low + j1:low + j2]
+            if len(gone) == len(came) and all(self._same_thing(a, b) for a, b in zip(gone, came)):
+                pairs.extend(zip(gone, came))
+                continue
+            for statement in gone:
+                if not self.removed(statement, scope, pending):
+                    return False
+            for statement in came:
+                if not self.added(statement, old_stmts, low + i1, scope, pending):
+                    return False
+        self.anchors.extend(pending)
+        for old, new in pairs:
+            self.statement(old, new, scope, old_stmts)
+        return True
+
+    @staticmethod
+    def _same_thing(old, new) -> bool:
+        if type(old) is not type(new):
+            return False
+        if isinstance(old, (*_DEFS, ast.ClassDef)):
+            return old.name == new.name
+        return True
+
+    def removed(self, statement, scope, pending) -> bool:
+        kind = scope[0]
+        if kind == "func":
+            if isinstance(statement, (ast.Global, ast.Nonlocal)):
+                return False
+            if not _inert(statement):
+                # only a test that used to run it can tell it is gone
+                pending.append(Anchor(DEFERRED, _first_line(statement), statement.end_lineno))
+            return True
+        cls = scope[1] if kind == "class" else None
+        first = _first_line(statement)
+        if isinstance(statement, ast.Pass):
+            return True
+        if _is_string(statement):
+            pending.append(Anchor(IMMEDIATE, first, statement.end_lineno, cls=cls, names=("__doc__",), doc=True))
+            return True
+        if isinstance(statement, _DEFS):
+            # whoever ran it, however they reached it
+            pending.append(Anchor(DEFERRED, statement.body[0].lineno, statement.end_lineno))
+            if kind == "class":
+                # a use of the name while the module loads now fails the import
+                pending.append(Anchor(IMMEDIATE, first, statement.lineno, cls=cls, probe=True))
+            else:
+                # and whoever imports the name or reads it without calling
+                pending.append(Anchor(IMMEDIATE, first, statement.lineno, names=(statement.name,)))
+            return True
+        if isinstance(statement, ast.ClassDef):
+            qual = statement.name if kind != "class" else f"{scope[1]}.{statement.name}"
+            pending.append(Anchor(IMMEDIATE, first, statement.lineno, cls=qual))
+            return True
+        if isinstance(statement, _BINDERS):
+            names = _bound_names(statement)
+            if not names:
+                return False
+            pending.append(Anchor(IMMEDIATE, first, statement.end_lineno, cls=cls, names=names))
+            return True
+        return False
+
+    def added(self, statement, old_stmts, index, scope, pending) -> bool:
+        """``index`` is where in ``old_stmts`` the new statement now sits."""
+        kind = scope[0]
+        if kind == "func":
+            if isinstance(statement, (ast.Global, ast.Nonlocal)):
+                return False
+            if _inert(statement):
+                return True
+            near = self._reached_with(old_stmts, index)
+            if near is None:
+                return False
+            # it runs only where control used to pass this point
+            pending.append(Anchor(DEFERRED, _first_line(near), near.end_lineno))
+            return True
+        if isinstance(statement, ast.Pass):
+            return True
+        cls = scope[1] if kind == "class" else None
+        if kind == "class":
+            node = scope[2]
+            first, last = _first_line(node), node.lineno  # the class statement: runs with the body
+        else:
+            near = self._reached_with(old_stmts, index)
+            if near is None:
+                return False
+            first, last = _first_line(near), near.end_lineno
+        if _is_string(statement):
+            pending.append(Anchor(IMMEDIATE, first, last, cls=cls, names=("__doc__",), doc=True))
+            return True
+        if isinstance(statement, (*_DEFS, ast.ClassDef)):
+            names: tuple[str, ...] = (statement.name,)
+        elif isinstance(statement, _BINDERS):
+            names = _bound_names(statement)
+        else:
+            return False
+        if not names:
+            return False
+        pending.append(Anchor(IMMEDIATE, first, last, cls=cls, names=names))
+        return True
+
+    @staticmethod
+    def _reached_with(old_stmts, index):
+        """An old statement of the block that runs whenever control reaches the gap
+        before ``old_stmts[index]``: the nearest traced one before it, or the one
+        right after it."""
+        for k in range(min(index, len(old_stmts)) - 1, -1, -1):
+            if _traced(old_stmts[k]):
+                return old_stmts[k]
+        for k in range(index, len(old_stmts)):
+            if _traced(old_stmts[k]):
+                return old_stmts[k]
+            if not (_inert(old_stmts[k]) or isinstance(old_stmts[k], (ast.Global, ast.Nonlocal))):
+                return None
+        return None
 
     def statement(self, old, new, scope, siblings):
         if type(old) is not type(new):
@@ -188,7 +415,12 @@ class _Differ:
         if signature_old != signature_new or type(old) is not type(new):
             self.anchors.append(Anchor(DEFERRED, old.body[0].lineno, old.end_lineno))
             return
-        self.block(old.body, new.body, ("func", old), None)
+        if _scoping(old) != _scoping(new):
+            # a name became local or stopped being one, or the function turned into a
+            # generator: that is decided when it is compiled, for the whole body
+            self.anchors.append(Anchor(DEFERRED, old.body[0].lineno, old.end_lineno))
+            return
+        self.block(old.body, new.body, ("func", old, new), None)
 
     def klass(self, old, new, scope):
         header_old = [_dump(x) for x in old.bases + old.keywords + old.decorator_list]
@@ -270,7 +502,11 @@ class _Differ:
                 for node in lambdas:
                     self.anchors.append(Anchor(DEFERRED, node.body.lineno, node.body.end_lineno))
                 return
-        names = ("__doc__",) if doc else _bound_names(old)
+        if doc:
+            names: tuple[str, ...] = ("__doc__",)
+        else:
+            names = _bound_names(old)
+            names += tuple(n for n in _bound_names(new) if n not in names)  # a new name can shadow one
         self.anchors.append(Anchor(IMMEDIATE, first, last, cls=cls, names=names, doc=bool(doc)))
 
 

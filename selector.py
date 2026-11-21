@@ -273,6 +273,7 @@ def read_pinned(path: str) -> str | None:
 
 def analyse(commit: str, text: str, maps: Maps) -> Decision:
     decision = Decision(commit)
+    import_reads: set[str] = set()
     for file_patch in patchlib.parse(text):
         old_path, new_path = file_patch.old_path, file_patch.new_path
         if old_path is None and new_path is None:
@@ -335,6 +336,9 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
                 else:
                     found = maps.lines(old_path, anchor.kind, anchor.start, anchor.end)
                 decision.broad |= found
+                if anchor.probe:
+                    decision.notes.append(f"{old_path}: {anchor!r}")
+                    continue
                 if anchor.kind == pydiff.IMMEDIATE and found and (anchor.cls or anchor.names):
                     # ran at import: narrow from "imported it" to "can read what it set"
                     if maps.tree is None:
@@ -344,6 +348,7 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
                     reading = finder.find(old_path, anchor.cls, anchor.names)
                     if reading is not None:
                         found &= reading
+                        import_reads |= finder.import_reads
                     elif anchor.doc:
                         found = set()  # a docstring is reachable only as __doc__, which nothing reads
                     elif anchor.cls:  # no read found by name: fall back to who used the class
@@ -357,6 +362,16 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
         decision.probe = maps.probe_modules(
             [path for path, new in decision.files.items() if new is not None and path.endswith(".py")]
         )
+        # and every module that reads a changed name while it loads: when that read
+        # fails, everything importing the module fails with it
+        for path in sorted(import_reads):
+            if decision.files.get(path, "") is None or not path.endswith(".py"):
+                continue
+            module = path[:-3].replace("/", ".")
+            if module.endswith(".__init__"):
+                module = module[: -len(".__init__")]
+            if module not in decision.probe:
+                decision.probe.append(module)
     if decision.candidates:
         decision.candidates |= maps.unknown
     if decision.broad:
@@ -400,7 +415,9 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
         long_tests = {n for n in candidates if seconds[n] >= BIG_SECONDS and run_cost[n] > LONG_CPU}
         if long_tests:
             def by_cost(n):
-                return (run_cost[n], n)
+                # classes with a costly setUpClass go last: a failure found before
+                # them saves paying for it
+                return (setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0) > 0.5, run_cost[n], n)
 
             quick = sorted((n for n in candidates if n not in long_tests and run_cost[n] <= EVIDENCE_CPU), key=by_cost)
             rest = sorted((n for n in candidates if n not in long_tests and run_cost[n] > EVIDENCE_CPU), key=by_cost)
