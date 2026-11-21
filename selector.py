@@ -82,6 +82,19 @@ DELTA_MIN = float(os.environ.get("BR_DELTA_MIN", "6.0"))
 DELTA_LONG_LIMIT = 15.0  # wall seconds for a test too long to run whole; past it, it is kept
 DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
 
+# A second way to let a long test go, accepted as a risk (BR_GUARD=0 turns it off).
+# It covers the one long test it was measured on, the executor's TPC-DS test. Its
+# guard is the quick candidates from its own test file plus the cheap candidates
+# that read a SQL fixture it reads (the optimizer's TPC-H test). With at least
+# GUARD_MIN quick ones from its file, and the whole guard passing, the long test is
+# let go even though some other candidate failed. On 127 practice commits where the
+# guard passed, the long test still failed in 5.
+GUARD = os.environ.get("BR_GUARD", "1") == "1"
+GUARD_FILES = ("tests/test_executor.py",)
+GUARD_MIN = 3
+GUARD_SHARE_CPU = 1.0  # a fixture-sharing test joins the guard when it costs no more than this
+GUARD_GAIN = 6.0  # seconds letting the long test go must save for the guard to be run
+
 WARM = os.environ.get("BR_WARM", "1") == "1"  # start workers from a pre-imported sqlglot core
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
 MAX_SINGLE_RUN = 10.0  # CPU seconds; two workers share 4 GB and the giants use over 1 GB
@@ -108,6 +121,7 @@ class Maps:
         self.cov: dict[str, dict | None] = {}
         self.importers = None
         self.outlines = None
+        self.opened = None  # test -> files it opens, made on first need
         self.tree = None  # ClassTree and readers.Finder, made on first need
         self.finder = None
         # the maps number tests as the pinned tests.json did; translate by id
@@ -181,6 +195,15 @@ class Maps:
     def readers(self, path: str) -> set[int]:
         runs = self.index["opens"].get(path)
         return self.tests(runs) if runs else set()
+
+    def opened_by(self, number: int) -> list[str]:
+        """Files the test opens as data."""
+        if self.opened is None:
+            self.opened = {}
+            for path, runs in self.index["opens"].items():
+                for test in self.tests(runs):
+                    self.opened.setdefault(test, []).append(path)
+        return self.opened.get(number, [])
 
     def listers(self, directory: str) -> set[int]:
         runs = self.index["dirs"].get(directory)
@@ -273,6 +296,7 @@ class Decision:
         self.notes: list[str] = []
         self.drop_when_clean: set[int] = set()  # see DROP: long tests to let go, set by plan()
         self.data_candidates: set[int] = set()  # candidates because they read a changed data file
+        self.guards: dict[int, set[int]] = {}  # see GUARD: long test -> the tests that vouch for it
         self.delta_files: list[str] = []  # SQL fixtures edited in place
         self.delta = False  # see DELTA: nothing but those changed
         self.delta_run = False  # set by plan(): run every candidate in delta mode
@@ -429,9 +453,63 @@ def split(tests: list[int], seconds: list[float]) -> list[list[int]]:
     return best[1]
 
 
+def guards_for(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
+               maps) -> dict[int, set[int]]:
+    """Long test -> its guard, for the long candidates the GUARD rule covers."""
+    found: dict[int, set[int]] = {}
+    if not GUARD or maps is None or not decision.runnable or decision.everything:
+        return found
+    # a test that reads a changed data file is no evidence about the code, and no
+    # long test that reads one is let go
+    candidates = decision.candidates - decision.data_candidates
+    for long_test in candidates:
+        if seconds[long_test] < BIG_SECONDS or run_cost[long_test] <= LONG_CPU:
+            continue
+        home = tests[long_test]["file"]
+        if home not in GUARD_FILES:
+            continue
+        guard = {n for n in candidates
+                 if n != long_test and tests[n]["file"] == home and run_cost[n] <= EVIDENCE_CPU}
+        if len(guard) < GUARD_MIN:
+            continue
+        for path in maps.opened_by(long_test):
+            if path.endswith(".sql"):
+                guard |= {n for n in maps.readers(path) & candidates
+                          if n != long_test and run_cost[n] <= GUARD_SHARE_CPU}
+        found[long_test] = guard
+    return found
+
+
 def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
-         setup_cost: dict[str, float]) -> list[int]:
-    """The candidates worth running, in order. Empty means keep them all unrun."""
+         setup_cost: dict[str, float], maps=None) -> list[int]:
+    """The candidates worth running, in order. Empty means keep them all unrun.
+
+    Guard tests (``decision.guards``) come last. A failure among the other tests
+    ends the other tests only; the guard still runs, until one of its own fails."""
+    decision.guards = {}
+    to_run = _plan(decision, tests, seconds, run_cost, setup_cost)
+    if decision.delta_run:
+        return to_run
+    guards = guards_for(decision, tests, seconds, run_cost, maps)
+    if not guards:
+        return to_run
+    kept = sorted(decision.candidates)
+    without = [n for n in kept if n not in guards]
+    saving = (approx_split(sum(seconds[n] for n in kept), max(seconds[n] for n in kept))
+              - (approx_split(sum(seconds[n] for n in without), max(seconds[n] for n in without)) if without else 0.0))
+    if saving < GUARD_GAIN:
+        return to_run  # another long test stays anyway: nothing to gain
+    decision.guards = guards
+    guard_tests = set().union(*guards.values())
+
+    def by_cost(n):
+        return (setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0) > 0.5, run_cost[n], n)
+
+    return [n for n in to_run if n not in guard_tests] + sorted(guard_tests, key=by_cost)
+
+
+def _plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
+          setup_cost: dict[str, float]) -> list[int]:
     candidates = sorted(decision.candidates)
     decision.drop_when_clean = set()
     decision.delta_run = False
@@ -561,7 +639,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             log(f"{commit}: keeping every test ({'; '.join(decision.notes)})")
             continue
         answers[commit] = set(decision.candidates)
-        to_run = plan(decision, tests, seconds, run_cost, setup_cost)
+        to_run = plan(decision, tests, seconds, run_cost, setup_cost, maps)
         log(f"{commit}: {len(decision.candidates)} candidates, running {len(to_run)} "
             f"[{' '.join(sorted(decision.kinds))}] {'; '.join(decision.notes)}")
         if to_run or decision.probe:
@@ -649,8 +727,9 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                     return round(DELTA_LONG_LIMIT * max(1.0, SPEED) + 6 * setup, 2)
                 return round(6 * (run_cost[n] + setup) + 5.0 * SPEED, 2)
 
-            limits = [(n, tests[n]["id"], limit_for(n)) for n in to_run]
-            wall = min(sum(limit for _, _, limit in limits) + 10.0, max(5.0, deadline - time.monotonic()))
+            guard_tests = set().union(*decision.guards.values()) if decision.guards else set()
+            limits = [(n, tests[n]["id"], limit_for(n), 1 if n in guard_tests else 0) for n in to_run]
+            wall = min(sum(limit for _, _, limit, _ in limits) + 10.0, max(5.0, deadline - time.monotonic()))
             job = {"root": root, "tests": limits, "stop": not decision.delta_run, "wall": wall + 20.0,
                    "probe": decision.probe, "warm": slot.warm}
             if decision.delta_run:
@@ -661,7 +740,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             slot.submit(job,
                         {"decision": decision, "root": root, "failed": False,
                          "probed": not decision.probe,
-                         "since": time.monotonic(), "ran": 0, "planned": len(to_run),
+                         "since": time.monotonic(), "ran": 0, "planned": len(to_run), "passed": set(),
                          "expected": sum(run_cost[n] for n in to_run)})
             running += 1
             return
@@ -699,9 +778,10 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                         handle["ran"] += 1
                         if not ok:
                             log(f"{handle['decision'].commit}: FAILED {tests[number]['id']}")
-                        if ok and (not handle["failed"] or handle["decision"].delta_run):
-                            # in delta mode each test stands for itself
+                        if ok:
+                            # a test that ran and passed is cleared, whatever else failed
                             answers[handle["decision"].commit].discard(number)
+                            handle["passed"].add(number)
                         else:
                             handle["failed"] = True
                     elif event[0] == "P":
@@ -717,6 +797,11 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                             log(f"{decision.commit}: the evidence passed, letting go of "
                                 f"{len(decision.drop_when_clean)} long tests")
                             answers[decision.commit] -= decision.drop_when_clean
+                        for long_test, guard in decision.guards.items():
+                            if guard <= handle["passed"] and long_test in answers[decision.commit]:
+                                log(f"{decision.commit}: its {len(guard)} guards passed, letting go of "
+                                    f"{tests[long_test]['id']}")
+                                answers[decision.commit].discard(long_test)
                         log(f"{handle['decision'].commit}: ran {handle['ran']}/{handle['planned']} in "
                             f"{time.monotonic() - handle['since']:.2f}s (expected {handle['expected']:.2f}s)")
                         runner.remove_overlay(handle["root"])

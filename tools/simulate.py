@@ -24,6 +24,9 @@ import selector  # noqa: E402
 from br import pydiff  # noqa: E402
 
 
+MAPS: dict[int, object] = {}  # id(tests) -> the maps they were loaded with
+
+
 def load(data_dir):
     tests = json.load(open(os.path.join(data_dir, "tests.json")))["tests"]
     answers = json.load(open(os.path.join(data_dir, "answers.json")))["commits"]
@@ -34,6 +37,7 @@ def load(data_dir):
         if number is not None:
             run_cost[number] = maps.index["cpu"][map_number]
     setup = dict(maps.index["class_setup_cpu"])
+    MAPS[id(tests)] = maps
     rows = []
     for patch in sorted(glob.glob(os.path.join(data_dir, "commits", "*.patch"))):
         name = os.path.basename(patch)[:-6]
@@ -51,11 +55,16 @@ def play(tests, seconds, run_cost, setup, decision, failing):
         kept = everything
         cpu = 0.0
     else:
-        to_run = selector.plan(decision, tests, seconds, run_cost, setup)
+        to_run = selector.plan(decision, tests, seconds, run_cost, setup, MAPS.get(id(tests)))
+        guard_tests = set().union(*decision.guards.values()) if decision.guards else set()
         kept = set(decision.candidates)
         cpu = selector.JOB_BASE_LOCAL if (to_run or decision.probe) else 0.0
         classes = set()
+        passed = set()
+        failed = guard_failed = False
         for number in to_run:
+            if not decision.delta_run and (guard_failed if number in guard_tests else failed):
+                continue
             key = tests[number]["id"].rsplit("::", 1)[0]
             if key in setup and key not in classes:
                 classes.add(key)
@@ -68,11 +77,16 @@ def play(tests, seconds, run_cost, setup, decision, failing):
                 continue
             cpu += run_cost[number]
             if number in failing:
-                break
+                failed = True
+                guard_failed = guard_failed or number in guard_tests
+                continue
             kept.discard(number)
-        else:
-            if not decision.delta_run:
-                kept -= decision.drop_when_clean
+            passed.add(number)
+        if not failed and not decision.delta_run:
+            kept -= decision.drop_when_clean
+        for long_test, guard in decision.guards.items():
+            if guard <= passed:
+                kept.discard(long_test)
     workers = selector.split(sorted(kept), seconds)
     cost = (max(sum(seconds[n] for n in w) for w in workers) + 2 * len(workers)) if workers else 0.0
     miss = 300.0 if failing - kept else 0.0

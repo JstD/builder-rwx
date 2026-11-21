@@ -44,11 +44,19 @@ For each patch the selector does three things.
    commit. When one is a candidate for a code change, the quick candidates are run
    as evidence (at least five, 0.3 s each at most), then others while the job
    stays within 6 CPU seconds. If nothing fails, the two long ones are dropped
-   unrun; anything else not run is kept. This is the only place the selector
-   accepts a risk of missing a failure. Measured on 514 practice commits made on
+   unrun; anything else not run is kept. This and the guard below are the only places
+   the selector accepts a risk of missing a failure. Measured on 514 practice commits made on
    lines those tests execute: the evidence passed 85 times and a long test then
    failed once (it ran far over its time rather than giving a wrong result).
    `BR_DROP=0` turns the rule off.
+
+   The TPC-DS executor test can also go when something unrelated failed. Its
+   guard is the quick candidates from the executor's test file (at least three)
+   plus the optimizer's TPC-H test when that is a candidate. If the whole guard
+   passes, the test is let go. A failure among the other tests then ends only
+   the other tests; the guard still runs. This is a second accepted risk: on 127
+   practice commits where the guard passed, the long test still failed in 5.
+   `BR_GUARD=0` turns it off.
 
 5. **Runs fixture-only commits on what changed.** Two SQL fixtures are read by
    61 tests, because the executor's class setup loads them, and one of those
