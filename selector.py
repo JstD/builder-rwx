@@ -104,8 +104,13 @@ SHARE_TABLES = os.environ.get("BR_SHARE_TABLES", "1") == "1"  # see harness.Shar
 # is used when those items are few enough to cost at most ITEMS_MAX_CPU.
 # BR_ITEMS=0 turns it off.
 ITEMS = os.environ.get("BR_ITEMS", "1") == "1"
-ITEMS_MAX_CPU = float(os.environ.get("BR_ITEMS_MAX", "6.0"))
+ITEMS_MAX_CPU = float(os.environ.get("BR_ITEMS_MAX", "8.0"))
 ITEMS_BASE_CPU = 2.5  # class setup, parsing every query, pickling the tables
+# The same for the other tests that loop over the items of a fixture (most of the
+# slower optimizer tests): one is run on its affected items when that takes at most
+# ITEMS_SHARE of the whole test, and the planner then counts it at that cost.
+ITEMS_SHARE = 0.7
+ITEMS_MIN_CPU = 0.3
 GUARD_FILES = ("tests/test_executor.py", "tests/test_parser.py")
 GUARD_MIN = 3
 GUARD_SHARE_CPU = 1.0  # a fixture-sharing test joins the guard when it costs no more than this
@@ -324,7 +329,8 @@ class Decision:
         self.data_candidates: set[int] = set()  # candidates because they read a changed data file
         self.guards: dict[int, set[int]] = {}  # see GUARD: long test -> the tests that vouch for it
         self.spans: list[tuple[str, int, int]] = []  # old lines of the function-level changes
-        self.restricted: dict[int, tuple[list[int], float]] = {}  # see ITEMS: test -> (items, CPU)
+        self.restricted: dict[int, tuple[dict, float]] = {}  # see ITEMS: long test -> (items, CPU)
+        self.partial: dict[int, tuple[dict, float]] = {}  # see ITEMS: other test -> (items, CPU)
         self.delta_files: list[str] = []  # SQL fixtures edited in place
         self.delta = False  # see DELTA: nothing but those changed
         self.delta_run = False  # set by plan(): run every candidate in delta mode
@@ -483,13 +489,49 @@ def split(tests: list[int], seconds: list[float]) -> list[list[int]]:
     return best[1]
 
 
+def affected_items(decision: Decision, info: dict):
+    """Positions (into ``info["ids"]``) of the items that run a changed line. None
+    when a changed line also runs while modules load: its effect is then not tied
+    to any item."""
+    affected: set[int] = set()
+    for path, start, end in decision.spans:
+        wanted = range(start, end + 1)
+        if any(line in wanted for line in info["imports"].get(path, ())):
+            return None
+        table = info["files"].get(path)
+        if table:
+            for line in wanted:
+                index = table["lines"].get(str(line))
+                if index is not None:
+                    affected |= expand(table["sets"][index])
+    return affected
+
+
+def only_for(info: dict, positions) -> dict:
+    """The harness's item filter for those positions."""
+    only: dict = {}
+    for position in sorted(positions):
+        kind, rest = info["ids"][position].split(":", 1)
+        if kind == "P":
+            only.setdefault("P", []).append(int(rest))
+        else:
+            fixture, index = rest.rsplit(":", 1)
+            only.setdefault("L", {}).setdefault(fixture, []).append(int(index))
+    return only
+
+
+def items_usable(decision: Decision, maps) -> bool:
+    return (ITEMS and maps is not None and decision.runnable and not decision.everything
+            and decision.kinds == {pydiff.DEFERRED} and bool(decision.spans)
+            and not any(path.startswith("tests/") for path in decision.files))
+
+
 def restricted_runs(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
-                    maps) -> dict[int, tuple[list[int], float]]:
-    """Long test -> (the items that can be affected, the CPU running them would cost),
-    for the long candidates that can be answered exactly and cheaply."""
-    found: dict[int, tuple[list[int], float]] = {}
-    if (not ITEMS or maps is None or not decision.runnable or decision.everything
-            or decision.kinds != {pydiff.DEFERRED} or not decision.spans):
+                    maps) -> dict[int, tuple[dict, float]]:
+    """Long test -> (its item filter, the CPU running those items would cost), for
+    the long candidates that can be answered exactly and cheaply."""
+    found: dict[int, tuple[dict, float]] = {}
+    if not items_usable(decision, maps):
         return found
     for long_test in decision.candidates:
         if seconds[long_test] < BIG_SECONDS or run_cost[long_test] <= LONG_CPU:
@@ -497,25 +539,37 @@ def restricted_runs(decision: Decision, tests: list[dict], seconds: list[float],
         info = maps.items().get(tests[long_test]["id"])
         if not info:
             continue
-        affected: set[int] = set()
-        usable = True
-        for path, start, end in decision.spans:
-            wanted = range(start, end + 1)
-            if any(line in wanted for line in info["imports"].get(path, ())):
-                usable = False  # runs while modules load: its effect is not tied to an item
-                break
-            table = info["files"].get(path)
-            if table:
-                for line in wanted:
-                    index = table["lines"].get(str(line))
-                    if index is not None:
-                        affected.update(table["sets"][index])
-        if not usable:
+        affected = affected_items(decision, info)
+        if affected is None:
             continue
         total = sum(info["weights"]) or 1.0
         cost = ITEMS_BASE_CPU + run_cost[long_test] * sum(info["weights"][i] for i in affected) / total
         if cost <= ITEMS_MAX_CPU:
-            found[long_test] = (sorted(affected), cost)
+            found[long_test] = (only_for(info, affected), cost)
+    return found
+
+
+def partial_runs(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
+                 maps) -> dict[int, tuple[dict, float]]:
+    """Test -> (its item filter, what it then costs), for the item-driven candidates
+    that are not long but still worth trimming."""
+    found: dict[int, tuple[dict, float]] = {}
+    if not items_usable(decision, maps):
+        return found
+    item_map = maps.items()
+    for number in decision.candidates:
+        if run_cost[number] < ITEMS_MIN_CPU or run_cost[number] > MAX_SINGLE_RUN:
+            continue
+        info = item_map.get(tests[number]["id"])
+        if not info:
+            continue
+        affected = affected_items(decision, info)
+        if affected is None:
+            continue
+        whole = info["base"] + sum(info["weights"])
+        share = (info["base"] + sum(info["weights"][i] for i in affected)) / whole if whole else 1.0
+        if share <= ITEMS_SHARE:
+            found[number] = (only_for(info, affected), run_cost[number] * share)
     return found
 
 
@@ -570,10 +624,17 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
     ends the other tests only; the guard still runs, until one of its own fails."""
     decision.guards = {}
     decision.restricted = {}
+    decision.partial = partial_runs(decision, tests, seconds, run_cost, maps)
+    whole_cost = run_cost
+    if decision.partial:
+        run_cost = list(run_cost)
+        for number, (_, cost) in decision.partial.items():
+            run_cost[number] = cost
     to_run = _plan(decision, tests, seconds, run_cost, setup_cost)
     if decision.delta_run:
+        decision.partial = {}
         return to_run
-    restricted = restricted_runs(decision, tests, seconds, run_cost, maps)
+    restricted = restricted_runs(decision, tests, seconds, whole_cost, maps)
     guards = {n: g for n, g in guards_for(decision, tests, seconds, run_cost, maps).items() if n not in restricted}
     if not guards and not restricted:
         return to_run
@@ -831,6 +892,8 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                 setup = setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0)
                 if n in decision.restricted:
                     return round(6 * (decision.restricted[n][1] + setup) + 5.0 * SPEED, 2)
+                if n in decision.partial and not decision.delta_run:
+                    return round(6 * (decision.partial[n][1] + setup) + 5.0 * SPEED, 2)
                 if decision.delta_run and run_cost[n] > MAX_SINGLE_RUN:
                     return round(DELTA_LONG_LIMIT * max(1.0, SPEED) + 6 * setup, 2)
                 return round(6 * (run_cost[n] + setup) + 5.0 * SPEED, 2)
@@ -839,7 +902,8 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             # flags: 1 a guard test, 3 a long test run on some of its items (always run)
             limits = [(n, tests[n]["id"], limit_for(n),
                        3 if n in decision.restricted else 1 if n in guard_tests else 0,
-                       decision.restricted[n][0] if n in decision.restricted else None)
+                       decision.restricted[n][0] if n in decision.restricted
+                       else decision.partial[n][0] if n in decision.partial and not decision.delta_run else None)
                       for n in to_run]
             wall = min(sum(entry[2] for entry in limits) + 10.0, max(5.0, deadline - time.monotonic()))
             job = {"root": root, "tests": limits, "stop": not decision.delta_run, "wall": wall + 20.0,

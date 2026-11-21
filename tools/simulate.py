@@ -80,7 +80,7 @@ def play(tests, seconds, run_cost, setup, decision, failing):
                 if number not in failing:
                     kept.discard(number)
                 continue
-            cpu += run_cost[number]
+            cpu += decision.partial[number][1] if number in decision.partial else run_cost[number]
             if number in failing:
                 failed = True
                 guard_failed = guard_failed or number in guard_tests

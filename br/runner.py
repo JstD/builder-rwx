@@ -183,7 +183,7 @@ def _work(job: dict, out_fd: int):
                     except (OSError, ValueError, KeyError):
                         harness.Items.pool_inputs = {}
                 harness.Items.only_checked = True
-                ok = session.run(test_id, limit, {"P": only})
+                ok = session.run(test_id, limit, only)
                 harness.Items.only_checked = False
             else:
                 ok = session.run(test_id, limit)

@@ -79,15 +79,19 @@ For each patch the selector does three things.
    changed code, so it is planned, and the long tests let go, exactly as for a
    commit with the code change alone. `BR_MIXED=0` turns it off.
 
-Where it is cheap, the TPC-DS executor test gets an exact answer instead. The
-test hands 99 queries to a process pool, and `maps/items.json` records which
-source lines each query runs. For a commit that only changes code inside
-functions, a query that runs none of the changed lines and is handed its pinned
-input does what it did on the pinned commit, so the test is run on the other
-queries alone ([br/harness.py](br/harness.py), `Items`). This is used when those
-queries cost at most 6 CPU seconds, and it replaces the guard. On 137 practice
-commits where it applies, its verdict matched the whole test's every time, for
-an eighth of the CPU. `BR_ITEMS=0` turns it off.
+Tests that loop over independent items are run on the items a change can reach.
+Most of the slower tests are such loops: over the pairs of a `.sql` fixture (the
+optimizer's tests) or over queries handed to a process pool (the executor's
+TPC-DS test). `maps/items.json` records which source lines each item runs. For a
+commit that only changes code inside functions, an item that runs none of the
+changed lines and is given its pinned input does what it did on the pinned
+commit, so the test is run on the other items alone ([br/harness.py](br/harness.py),
+`Items`) and that gives its verdict. Eleven mid-cost tests are trimmed this way
+whenever it saves 30% or more, and the planner counts them at the trimmed cost.
+The TPC-DS executor test is run this way when its affected queries cost at most
+8 CPU seconds, which replaces the guard with the real answer. Checked against
+whole runs on practice commits: 656 trimmed runs of the mid-cost tests and 171
+of the TPC-DS test, every verdict the same. `BR_ITEMS=0` turns it off.
 
 One cost is shared between jobs. The executor's test class parses 32 CSV tables
 in its `setUpClass`, about a second of CPU in every job that runs one of its
@@ -139,8 +143,11 @@ python /repo/tools/class_tree.py /work/classes.json
 python /repo/tools/compile_map.py /repo/sample/tests.json /work/trace /work/timing.json /repo/maps
 cp /work/classes.json /repo/maps/classes.json
 python /repo/tools/outline.py /app/sqlglot /repo/maps
-BR_ITEMS=1 python /repo/tools/trace_one.py /repo/sample/tests.json 1106 /work/trace_items
-python /repo/tools/compile_items.py /repo/maps/items.json /work/trace_items/1106.json
+# per-item traces of the item-driven tests (numbers from tests.json), then the item map
+for n in 1106 1440 1382 1295 1343 1454 1434 1355 1441 1599 1561 1378; do
+  BR_ITEMS=1 python /repo/tools/trace_one.py /repo/sample/tests.json $n /work/trace_items
+done
+python /repo/tools/compile_items.py /repo/maps/items.json /work/trace_items/*.json
 python /repo/tools/pool_inputs.py /repo/maps/pool_inputs.json \
   tests/test_executor.py::TestExecutor::test_execute_tpch \
   tests/test_executor.py::TestExecutor::test_execute_tpcds
