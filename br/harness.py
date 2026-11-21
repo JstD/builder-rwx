@@ -266,6 +266,108 @@ class _Verdict(unittest.TestResult):
         self.bad = True
 
 
+class SharedTables:
+    """The executor test class loads 32 CSV tables in its setUpClass, in pure Python,
+    which costs about a second of CPU in every job that runs one of its tests. The
+    rows depend only on the CSV files and the schema in tests/helpers.py, so they
+    are parsed once, before the workers fork (``parse``), and a job whose patch
+    touches nothing under tests/ builds the class from them (``setup``). Everything
+    else setUpClass does is done as written there, with the patched code."""
+
+    FILE = "tests/test_executor.py"
+    CLASS = "TestExecutor"
+    # sha1 of the pinned setUpClass source: the shortcut is only for exactly that code
+    SOURCE = "120988b74899ec199c4f9f167fd14db3924750a2"
+    rows = None  # {"tpch": {table: [row tuples]}, "tpcds": {...}}
+    enabled = False  # per job
+
+    @classmethod
+    def parse(cls, checkout: str) -> None:
+        import ast
+        import csv
+        import gzip
+        import runpy
+
+        helpers = runpy.run_path(os.path.join(checkout, "tests", "helpers.py"))
+        fixtures = os.path.join(checkout, "tests", "fixtures")
+
+        def open_file(file_name):
+            with open(file_name, "rb") as f:
+                gzipped = f.read(2) == b"\x1f\x8b"
+            if gzipped:
+                return gzip.open(file_name, "rt", newline="")
+            return open(file_name, encoding="utf-8", newline="")
+
+        def load(directory, schema):
+            tables = {}
+            for table in schema:
+                # the loop of the test's own setup(), unchanged
+                reader = csv.reader(open_file(f"{directory}{table}.csv.gz"), delimiter="|")
+                rows = []
+                ctypes = []
+                next(reader)
+                for row in reader:
+                    if not ctypes:
+                        for i, v in enumerate(row):
+                            try:
+                                ctypes.append(type(ast.literal_eval(v)))
+                            except (ValueError, SyntaxError):
+                                ctypes.append(str)
+                    rows.append(
+                        tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
+                    )
+                tables[table] = rows
+            return tables
+
+        cls.rows = {
+            "tpch": load(fixtures + "/optimizer/tpc-h/", helpers["TPCH_SCHEMA"]),
+            "tpcds": load(fixtures + "/optimizer/tpc-ds/", helpers["TPCDS_SCHEMA"]),
+        }
+
+    @classmethod
+    def usable(cls, file: str, cls_name: str, module) -> bool:
+        if cls.rows is None or not cls.enabled or (file, cls_name) != (cls.FILE, cls.CLASS):
+            return False
+        try:
+            with open(module.__file__, encoding="utf-8") as handle:
+                source = handle.read()
+            start = source.index("    @classmethod\n    def setUpClass(cls):")
+            end = source.index("    @classmethod\n    def tearDownClass(cls):")
+            return hashlib.sha1(source[start:end].encode("utf-8")).hexdigest() == cls.SOURCE
+        except (OSError, ValueError):
+            return False
+
+    @classmethod
+    def setup(cls, test_class, module) -> None:
+        """What the pinned setUpClass does, with the rows already parsed."""
+        test_class.tpch_conn = module.duckdb.connect()
+        test_class.tpcds_conn = module.duckdb.connect()
+        test_class.tpch_tables = {}
+        test_class.tpcds_tables = {}
+
+        def setup(conn, directory, table, columns, tables, parsed):
+            file_name = f"{directory}{table}.csv.gz"
+
+            conn.execute(
+                f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+            )
+            tables[table] = module.Table(columns=columns, rows=list(parsed[table]))
+
+        for table, columns in module.TPCH_SCHEMA.items():
+            setup(test_class.tpch_conn, module.DIR_TPCH, table, columns, test_class.tpch_tables, cls.rows["tpch"])
+
+        for table, columns in module.TPCDS_SCHEMA.items():
+            setup(test_class.tpcds_conn, module.DIR_TPCDS, table, columns, test_class.tpcds_tables, cls.rows["tpcds"])
+
+        test_class.cache = {}
+        test_class.tpch_sqls = list(module.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+        test_class.tpcds_sqls = list(module.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+
+
 def module_name(file: str) -> str:
     return file[:-3].replace("/", ".")
 
@@ -312,7 +414,10 @@ class Session:
             ok = True
             if not getattr(cls, "__unittest_skip__", False):
                 try:
-                    cls.setUpClass()
+                    if SharedTables.usable(file, cls_name, self.modules[file]):
+                        SharedTables.setup(cls, self.modules[file])
+                    else:
+                        cls.setUpClass()
                 except Abort:
                     raise
                 except BaseException as error:

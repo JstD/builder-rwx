@@ -94,6 +94,7 @@ DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
 # or more from its file: the guard passed 127 times and the long test still failed
 # in 5. TPC-DS, fewer than three: 40 times, 0 failed. test_max_nodes: 21 times, 0.
 GUARD = os.environ.get("BR_GUARD", "1") == "1"
+SHARE_TABLES = os.environ.get("BR_SHARE_TABLES", "1") == "1"  # see harness.SharedTables
 GUARD_FILES = ("tests/test_executor.py", "tests/test_parser.py")
 GUARD_MIN = 3
 GUARD_SHARE_CPU = 1.0  # a fixture-sharing test joins the guard when it costs no more than this
@@ -681,6 +682,20 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
 
     # duckdb and pandas are worth loading once only if more than one job needs them
     heavy = sum(1 for _, to_run in jobs if any(tests[n]["file"] in HEAVY_FILES for n in to_run))
+    # The executor class's tables: parsed here once when at least two jobs would
+    # otherwise each parse them (see harness.SharedTables).
+    def shares_tables(decision, to_run):
+        return (SHARE_TABLES and not any(path.startswith("tests/") for path in decision.files)
+                and any(tests[n]["file"] == harness.SharedTables.FILE for n in to_run))
+
+    from br import harness
+
+    if sum(1 for decision, to_run in jobs if shares_tables(decision, to_run)) >= 2:
+        try:
+            harness.SharedTables.parse(CHECKOUT)
+        except Exception:
+            harness.SharedTables.rows = None
+            log(f"tables not shared\n{traceback.format_exc()}")
     runner.preload(heavy=heavy >= 2)
     log(f"preloaded: {sum(os.times()[:4]):.2f}s cpu so far")
     os.makedirs(WORK, exist_ok=True)
@@ -752,7 +767,8 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             limits = [(n, tests[n]["id"], limit_for(n), 1 if n in guard_tests else 0) for n in to_run]
             wall = min(sum(limit for _, _, limit, _ in limits) + 10.0, max(5.0, deadline - time.monotonic()))
             job = {"root": root, "tests": limits, "stop": not decision.delta_run, "wall": wall + 20.0,
-                   "probe": decision.probe, "warm": slot.warm}
+                   "probe": decision.probe, "warm": slot.warm,
+                   "shared_tables": harness.SharedTables.rows is not None and shares_tables(decision, to_run)}
             if decision.delta_run:
                 job["delta"] = {"pinned": CHECKOUT, "files": decision.delta_files,
                                 "pool": str(MAPS / "pool_inputs.json"),

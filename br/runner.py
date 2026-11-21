@@ -147,6 +147,7 @@ def _work(job: dict, out_fd: int):
             os.write(out_fd, b"P %d\n" % (1 if ok else 0))
             if not ok:
                 os._exit(0)
+        harness.SharedTables.enabled = bool(job.get("shared_tables"))
         delta = job.get("delta")
         if delta:
             # fixtures changed and no code: tests run only on what differs (harness.Items)

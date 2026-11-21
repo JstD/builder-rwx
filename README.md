@@ -79,6 +79,13 @@ For each patch the selector does three things.
    changed code, so it is planned, and the long tests let go, exactly as for a
    commit with the code change alone. `BR_MIXED=0` turns it off.
 
+One cost is shared between jobs. The executor's test class parses 32 CSV tables
+in its `setUpClass`, about a second of CPU in every job that runs one of its
+tests. The rows depend only on those files, so they are parsed once before the
+workers fork, and a job whose patch touches nothing under `tests/` builds the
+class from them; the rest of the setup runs as written, on the patched code
+(`harness.SharedTables`, checked equal to the real setup value by value).
+
 Whatever is kept is split longest-first across the worker count that minimises
 busiest worker + 2 s per worker.
 
