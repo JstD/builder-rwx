@@ -39,6 +39,7 @@ WORK = os.environ.get("BR_WORK", "/tmp/br")
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 SLOTS = 2
+RUN = os.environ.get("BR_RUN", "1") == "1"  # 0: never run a test, answer from the maps alone
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))  # seconds for the whole batch
 JOB_BASE = 0.3  # CPU seconds to fork a worker and import sqlglot
 SPEED = float(os.environ.get("BR_SPEED", "1.0"))  # our CPU seconds per traced CPU second
@@ -465,6 +466,13 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             jobs.append((decision, to_run))
 
     log(f"analysed {len(patches)} commits, {len(jobs)} to run: {sum(os.times()[:4]):.2f}s cpu so far")
+    if not RUN:
+        # Answer from the maps alone. Without the import check the narrowing of
+        # import-time changes is not verified, so those fall back to the wider set.
+        for decision, _ in jobs:
+            if decision.probe:
+                answers[decision.commit] = set(decision.broad)
+        return
     if not jobs:
         return
 
@@ -636,13 +644,16 @@ def main() -> None:
 
     import signal
 
-    signal.signal(signal.SIGALRM, last_resort)
-    signal.setitimer(signal.ITIMER_REAL, WALL_BUDGET + 12.0)
+    timed = hasattr(signal, "SIGALRM")  # absent only where this is run for development
+    if timed:
+        signal.signal(signal.SIGALRM, last_resort)
+        signal.setitimer(signal.ITIMER_REAL, WALL_BUDGET + 12.0)
     try:
         solve(patches, tests, answers, started)
     except Exception:
         log(f"selector failed, keeping what is safe\n{traceback.format_exc()}")
-    signal.setitimer(signal.ITIMER_REAL, 0)
+    if timed:
+        signal.setitimer(signal.ITIMER_REAL, 0)
     emit(patches, tests, answers)
     log(f"answered {len(patches)} commits in {time.monotonic() - started:.1f}s wall, "
         f"{sum(os.times()[:4]):.1f}s cpu")
