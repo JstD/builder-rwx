@@ -83,17 +83,22 @@ DELTA_LONG_LIMIT = 15.0  # wall seconds for a test too long to run whole; past i
 DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
 
 # A second way to let a long test go, accepted as a risk (BR_GUARD=0 turns it off).
-# It covers the one long test it was measured on, the executor's TPC-DS test. Its
-# guard is the quick candidates from its own test file plus the cheap candidates
-# that read a SQL fixture it reads (the optimizer's TPC-H test). With at least
-# GUARD_MIN quick ones from its file, and the whole guard passing, the long test is
-# let go even though some other candidate failed. On 127 practice commits where the
-# guard passed, the long test still failed in 5.
+# It covers the two long tests it was measured on: the executor's TPC-DS test and the
+# parser's test_max_nodes. A long test's guard is the quick candidates from its own
+# test file plus the cheap candidates that read a SQL fixture it reads (for TPC-DS,
+# the optimizer's TPC-H test). When the whole guard passes, the long test is let go
+# even though some other candidate failed. The guard needs GUARD_MIN quick tests
+# from the long test's file; with fewer, it needs a fixture-sharing test, and takes
+# the cheapest (the optimizer's own TPC-DS test if nothing cheaper is a candidate).
+# Measured on practice commits aimed at the lines the long tests run. TPC-DS, three
+# or more from its file: the guard passed 127 times and the long test still failed
+# in 5. TPC-DS, fewer than three: 40 times, 0 failed. test_max_nodes: 21 times, 0.
 GUARD = os.environ.get("BR_GUARD", "1") == "1"
-GUARD_FILES = ("tests/test_executor.py",)
+GUARD_FILES = ("tests/test_executor.py", "tests/test_parser.py")
 GUARD_MIN = 3
 GUARD_SHARE_CPU = 1.0  # a fixture-sharing test joins the guard when it costs no more than this
 GUARD_GAIN = 6.0  # seconds letting the long test go must save for the guard to be run
+GUARD_MAX_CANDIDATES = 500
 
 WARM = os.environ.get("BR_WARM", "1") == "1"  # start workers from a pre-imported sqlglot core
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
@@ -459,6 +464,12 @@ def guards_for(decision: Decision, tests: list[dict], seconds: list[float], run_
     found: dict[int, set[int]] = {}
     if not GUARD or maps is None or not decision.runnable or decision.everything:
         return found
+    if len(decision.candidates) > GUARD_MAX_CANDIDATES:
+        # A change nearly every test can see (a module everything imports) is where a
+        # test's verdict can depend on what ran before it in the same process, so
+        # nothing is cleared by running a few tests here. It would also save little:
+        # the other candidates stay.
+        return found
     # a test that reads a changed data file is no evidence about the code, and no
     # long test that reads one is let go
     candidates = decision.candidates - decision.data_candidates
@@ -470,12 +481,22 @@ def guards_for(decision: Decision, tests: list[dict], seconds: list[float], run_
             continue
         guard = {n for n in candidates
                  if n != long_test and tests[n]["file"] == home and run_cost[n] <= EVIDENCE_CPU}
-        if len(guard) < GUARD_MIN:
-            continue
+        sharing: set[int] = set()
         for path in maps.opened_by(long_test):
             if path.endswith(".sql"):
-                guard |= {n for n in maps.readers(path) & candidates
-                          if n != long_test and run_cost[n] <= GUARD_SHARE_CPU}
+                sharing |= {n for n in maps.readers(path) & candidates
+                            if n != long_test and tests[n]["file"] != home and run_cost[n] <= MAX_SINGLE_RUN}
+        cheap = {n for n in sharing if run_cost[n] <= GUARD_SHARE_CPU}
+        if len(guard) >= GUARD_MIN:
+            guard |= cheap
+        elif cheap:
+            # too few from its own file to mean anything: a test over the same
+            # fixtures has to be there to vouch for it
+            guard |= cheap
+        elif sharing:
+            guard.add(min(sharing, key=lambda n: (run_cost[n], n)))
+        else:
+            continue
         found[long_test] = guard
     return found
 
