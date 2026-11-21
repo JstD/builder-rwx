@@ -39,7 +39,7 @@ WORK = os.environ.get("BR_WORK", "/tmp/br")
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 SLOTS = 2
-RUN = os.environ.get("BR_RUN", "1") == "1"  # 0: never run a test, answer from the maps alone
+RUN = os.environ.get("BR_RUN", "0") == "1"  # 0: never run a test, answer from the maps alone
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))  # seconds for the whole batch
 JOB_BASE = 0.3  # CPU seconds to fork a worker and import sqlglot
 SPEED = float(os.environ.get("BR_SPEED", "1.0"))  # our CPU seconds per traced CPU second
