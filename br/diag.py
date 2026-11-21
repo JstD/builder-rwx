@@ -9,6 +9,11 @@ normal answer's simulated seconds sit. Each run picks one page at random:
   page 1  Commits where a failure was seen lose the long tests they kept unrun.
           The missed count is how many of those long tests really fail.
 
+  page 2  Commits where no failure was seen lose the long tests they keep. The
+          missed count is how many of those long tests really fail.
+  page 3  Commits that keep two or more tests with no failure seen, and change no
+          data file, get an empty answer. The missed count is how many really fail.
+
 What the selector itself knows about the page is written into the last five
 digits of the simulated milliseconds, by padding answers that cannot be affected
 with extra tests until the total ends in those digits:
@@ -17,6 +22,8 @@ with extra tests until the total ends in those digits:
                     are, I = how many have a module- or class-level change
   page 1  1 LL B D  LL = seconds saved by removing the long tests, B = commits
                     it was done on, D = commits where the drop rule fired
+  page 2  2 LL B F  as page 1, F = how many of those commits change a data file
+  page 3  3 CC NN   CC = seconds the emptied commits cost, NN = how many there are
 """
 
 from __future__ import annotations
@@ -68,7 +75,7 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
     seconds = [test["seconds"] for test in tests]
     commits = [path.stem for path in patches]
     if page is None:
-        page = os.urandom(1)[0] & 1
+        page = 2 + (os.urandom(1)[0] & 1)  # pages 0 and 1 were read on the first submission
     workers = {commit: split(sorted(answers[commit]), seconds) for commit in commits}
     before = {commit: cost_ms(workers[commit], duration) for commit in commits}
     touched: set[str] = set()
@@ -84,6 +91,26 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
                     immediate += 1
                 workers[commit] = []
         digits = min(99, round(total / 1000)) * 100 + min(9, len(touched)) * 10 + min(9, immediate)
+    elif page == 2:
+        saved = count = data = 0
+        for commit in commits:
+            if commit not in INFO["failed"] and answers[commit] & long_tests:
+                slim = split(sorted(answers[commit] - long_tests), seconds)
+                saved += before[commit] - cost_ms(slim, duration)
+                count += 1
+                data += "data" in INFO["kinds"].get(commit, ())
+                touched.add(commit)
+                workers[commit] = slim
+        digits = min(99, round(saved / 1000)) * 100 + min(9, count) * 10 + min(9, data)
+    elif page == 3:
+        total = 0
+        for commit in commits:
+            if (len(answers[commit]) >= 2 and commit not in INFO["failed"]
+                    and "data" not in INFO["kinds"].get(commit, ())):
+                touched.add(commit)
+                total += before[commit]
+                workers[commit] = []
+        digits = min(99, round(total / 1000)) * 100 + min(99, len(touched))
     else:
         saved = count = 0
         for commit in commits:
