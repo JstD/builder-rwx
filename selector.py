@@ -42,8 +42,9 @@ SLOTS = 2
 SLICED = os.environ.get("BR_SLICED", "1") == "1"  # parse only the changed statements, via maps/outline.json
 RUN = os.environ.get("BR_RUN", "1") == "1"  # 0: never run a test, answer from the maps alone
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))  # seconds for the whole batch
-JOB_BASE = 0.3  # CPU seconds to fork a worker and import sqlglot
-SPEED = float(os.environ.get("BR_SPEED", "1.0"))  # our CPU seconds per traced CPU second
+JOB_BASE_LOCAL = 0.15  # CPU seconds to fork a worker and import what a test needs, as timed for the maps
+SPEED = float(os.environ.get("BR_SPEED", "2.0"))  # the scorer's CPU seconds per CPU second timed for the maps
+JOB_BASE = JOB_BASE_LOCAL * SPEED
 
 # How likely a change of each kind is to break at least one candidate (p), and,
 # when it does, how likely each candidate is to be one of the broken (q). They
@@ -66,7 +67,7 @@ BIG_SECONDS = float(os.environ.get("BR_BIG", "3.0"))
 DROP_CAP = float(os.environ.get("BR_DROP_CAP", "8.0"))
 DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "3"))
 
-WARM = os.environ.get("BR_WARM", "0") == "1"  # start workers from a pre-imported sqlglot core (no gain measured)
+WARM = os.environ.get("BR_WARM", "1") == "1"  # start workers from a pre-imported sqlglot core
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
 MAX_SINGLE_RUN = 10.0  # CPU seconds; two workers share 4 GB and the giants use over 1 GB
 
@@ -547,7 +548,14 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             except Exception:
                 log(f"{decision.commit}: overlay failed\n{traceback.format_exc()}")
                 continue
-            limits = [(n, tests[n]["id"], round(6 * run_cost[n] + 3.0, 2)) for n in to_run]
+            # A test's limit is generous (a timeout only ever keeps tests) and must
+            # cover what the first test of a class also pays for: importing the test
+            # module and its setUpClass, which for the executor loads every table.
+            limits = [
+                (n, tests[n]["id"],
+                 round(6 * (run_cost[n] + setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0)) + 5.0 * SPEED, 2))
+                for n in to_run
+            ]
             wall = min(sum(limit for _, _, limit in limits) + 10.0, max(5.0, deadline - time.monotonic()))
             slot.submit({"root": root, "tests": limits, "stop": True, "wall": wall + 20.0,
                          "probe": decision.probe, "warm": slot.warm},

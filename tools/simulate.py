@@ -53,7 +53,7 @@ def play(tests, seconds, run_cost, setup, decision, failing):
     else:
         to_run = selector.plan(decision, tests, seconds, run_cost, setup)
         kept = set(decision.candidates)
-        cpu = selector.JOB_BASE if (to_run or decision.probe) else 0.0
+        cpu = selector.JOB_BASE_LOCAL if (to_run or decision.probe) else 0.0
         classes = set()
         for number in to_run:
             key = tests[number]["id"].rsplit("::", 1)[0]
