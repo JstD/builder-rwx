@@ -35,6 +35,10 @@ one was. Counts and CPU seconds are given as buckets (see the code).
   page 5  5 Q T F L  first quiet commit: Q = quick code candidates, T = their CPU,
                      F = 1 drop rule set + 2 something ran + 4 guard set, L = which
                      long test (1 TPC-DS, 2 max_nodes, 3 both)
+  page 7  7 L K E G  first loud commit: L = which long test it keeps, K = kinds,
+                     E = quick executor candidates, G as on page 6
+  page 8  8 L K D F  first quiet commit: L, K as above, D = candidates that read a
+                     changed data file, F as on page 5
   page 6  6 N K E G  N = loud commits; the first one: K = kinds as above, E = quick
                      executor candidates, G = 1 guard set + 2 a guard test failed
                      + 4 a data file changed
@@ -89,7 +93,7 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
     seconds = [test["seconds"] for test in tests]
     commits = [path.stem for path in patches]
     if page is None:
-        page = 4 + os.urandom(1)[0] % 3  # pages 0 to 3 were read on earlier submissions
+        page = 7 + (os.urandom(1)[0] & 1)  # the two pages that matter now
     workers = {commit: split(sorted(answers[commit]), seconds) for commit in commits}
     before = {commit: cost_ms(workers[commit], duration) for commit in commits}
     touched: set[str] = set()
@@ -127,6 +131,20 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
                  + (4 if loud and "data" in INFO["kinds"].get(loud[0], ()) else 0))
         digits = (min(9, len(loud)) * 1000 + (kind_bits(loud[0]) if loud else 0) * 100
                   + count_bucket(first.get("exec_quick", 0)) * 10 + flags)
+    elif page in (7, 8):
+        group = loud if page == 7 else quiet
+        first = facts.get(group[0], {}) if group else {}
+        kept_long = answers[group[0]] & long_tests if group else set()
+        which = sum(1 if seconds[n] < 25 else 2 for n in kept_long)
+        if page == 7:
+            flags = ((1 if first.get("guard") else 0)
+                     + (2 if group and group[0] in INFO.get("guard_failed", ()) else 0)
+                     + (4 if group and "data" in INFO["kinds"].get(group[0], ()) else 0))
+            third = count_bucket(first.get("exec_quick", 0))
+        else:
+            flags = (1 if first.get("drop") else 0) + (2 if first.get("ran") else 0) + (4 if first.get("guard") else 0)
+            third = count_bucket(first.get("data", 0))
+        digits = which * 1000 + (kind_bits(group[0]) if group else 0) * 100 + third * 10 + flags
     elif page == 0:
         total = immediate = 0
         for commit in commits:
