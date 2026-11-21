@@ -71,6 +71,15 @@ LONG_CPU = float(os.environ.get("BR_LONG_CPU", "10.0"))  # a long test is one th
 DROP_CAP = float(os.environ.get("BR_DROP_CAP", "6.0"))
 DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "5"))
 
+# A commit that edits SQL fixtures and no code is run in delta mode (see
+# br/harness.py): each test that reads a changed fixture runs only on the items that
+# differ from the pinned file, which takes a fraction of the whole test, and every
+# test gets its own verdict. Worth it once keeping the readers would cost DELTA_MIN
+# seconds. BR_DELTA=0 turns it off.
+DELTA = os.environ.get("BR_DELTA", "1") == "1"
+DELTA_MIN = float(os.environ.get("BR_DELTA_MIN", "6.0"))
+DELTA_LONG_LIMIT = 15.0  # wall seconds for a test too long to run whole; past it, it is kept
+
 WARM = os.environ.get("BR_WARM", "1") == "1"  # start workers from a pre-imported sqlglot core
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
 MAX_SINGLE_RUN = 10.0  # CPU seconds; two workers share 4 GB and the giants use over 1 GB
@@ -261,6 +270,9 @@ class Decision:
         self.kinds: set[str] = set()
         self.notes: list[str] = []
         self.drop_when_clean: set[int] = set()  # see DROP: long tests to let go, set by plan()
+        self.delta_files: list[str] = []  # SQL fixtures edited in place
+        self.delta = False  # see DELTA: nothing but those changed
+        self.delta_run = False  # set by plan(): run every candidate in delta mode
 
 
 def read_pinned(path: str) -> str | None:
@@ -274,6 +286,7 @@ def read_pinned(path: str) -> str | None:
 def analyse(commit: str, text: str, maps: Maps) -> Decision:
     decision = Decision(commit)
     import_reads: set[str] = set()
+    other_changes = False
     for file_patch in patchlib.parse(text):
         old_path, new_path = file_patch.old_path, file_patch.new_path
         if old_path is None and new_path is None:
@@ -316,6 +329,10 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
             decision.files[new_path] = new_text
         if old_path == new_path and new_text == old_text:
             continue  # nothing in the file changed (a mode change, say)
+        if old_path == new_path and old_path.startswith("tests/fixtures/") and old_path.endswith(".sql"):
+            decision.delta_files.append(old_path)
+        else:
+            other_changes = True
         if old_path is not None:
             # tests that read the old file as data see any change to it
             readers = maps.readers(old_path)
@@ -372,6 +389,8 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
                 module = module[: -len(".__init__")]
             if module not in decision.probe:
                 decision.probe.append(module)
+    decision.delta = (bool(decision.delta_files) and not other_changes and decision.runnable
+                      and not decision.everything and decision.kinds == {"data"})
     if decision.candidates:
         decision.candidates |= maps.unknown
     if decision.broad:
@@ -409,8 +428,15 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
     """The candidates worth running, in order. Empty means keep them all unrun."""
     candidates = sorted(decision.candidates)
     decision.drop_when_clean = set()
+    decision.delta_run = False
     if not candidates or not decision.runnable or decision.everything:
         return []
+    if DELTA and decision.delta:
+        keep_all = approx_split(sum(seconds[n] for n in candidates), max(seconds[n] for n in candidates))
+        if keep_all >= DELTA_MIN:
+            decision.delta_run = True
+            return sorted(candidates, key=lambda n: (
+                setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0) > 0.5, run_cost[n], n))
     if DROP and "data" not in decision.kinds:
         long_tests = {n for n in candidates if seconds[n] >= BIG_SECONDS and run_cost[n] > LONG_CPU}
         if long_tests:
@@ -595,14 +621,20 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             # A test's limit is generous (a timeout only ever keeps tests) and must
             # cover what the first test of a class also pays for: importing the test
             # module and its setUpClass, which for the executor loads every table.
-            limits = [
-                (n, tests[n]["id"],
-                 round(6 * (run_cost[n] + setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0)) + 5.0 * SPEED, 2))
-                for n in to_run
-            ]
+            def limit_for(n):
+                setup = setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0)
+                if decision.delta_run and run_cost[n] > MAX_SINGLE_RUN:
+                    return round(DELTA_LONG_LIMIT * max(1.0, SPEED) + 6 * setup, 2)
+                return round(6 * (run_cost[n] + setup) + 5.0 * SPEED, 2)
+
+            limits = [(n, tests[n]["id"], limit_for(n)) for n in to_run]
             wall = min(sum(limit for _, _, limit in limits) + 10.0, max(5.0, deadline - time.monotonic()))
-            slot.submit({"root": root, "tests": limits, "stop": True, "wall": wall + 20.0,
-                         "probe": decision.probe, "warm": slot.warm},
+            job = {"root": root, "tests": limits, "stop": not decision.delta_run, "wall": wall + 20.0,
+                   "probe": decision.probe, "warm": slot.warm}
+            if decision.delta_run:
+                job["delta"] = {"pinned": CHECKOUT, "files": decision.delta_files,
+                                "pool": str(MAPS / "pool_inputs.json")}
+            slot.submit(job,
                         {"decision": decision, "root": root, "failed": False,
                          "probed": not decision.probe,
                          "since": time.monotonic(), "ran": 0, "planned": len(to_run),
@@ -643,7 +675,8 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                         handle["ran"] += 1
                         if not ok:
                             log(f"{handle['decision'].commit}: FAILED {tests[number]['id']}")
-                        if ok and not handle["failed"]:
+                        if ok and (not handle["failed"] or handle["decision"].delta_run):
+                            # in delta mode each test stands for itself
                             answers[handle["decision"].commit].discard(number)
                         else:
                             handle["failed"] = True

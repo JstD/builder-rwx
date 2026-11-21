@@ -60,12 +60,19 @@ def play(tests, seconds, run_cost, setup, decision, failing):
             if key in setup and key not in classes:
                 classes.add(key)
                 cpu += setup[key]
+            if decision.delta_run:
+                # every test runs, on the changed items only: a guess at the cost
+                cpu += min(run_cost[number], 1.5)
+                if number not in failing:
+                    kept.discard(number)
+                continue
             cpu += run_cost[number]
             if number in failing:
                 break
             kept.discard(number)
         else:
-            kept -= decision.drop_when_clean
+            if not decision.delta_run:
+                kept -= decision.drop_when_clean
     workers = selector.split(sorted(kept), seconds)
     cost = (max(sum(seconds[n] for n in w) for w in workers) + 2 * len(workers)) if workers else 0.0
     miss = 300.0 if failing - kept else 0.0

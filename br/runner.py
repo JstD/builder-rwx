@@ -147,6 +147,16 @@ def _work(job: dict, out_fd: int):
             os.write(out_fd, b"P %d\n" % (1 if ok else 0))
             if not ok:
                 os._exit(0)
+        delta = job.get("delta")
+        if delta:
+            # fixtures changed and no code: tests run only on what differs (harness.Items)
+            try:
+                with open(delta["pool"], encoding="utf-8") as handle:
+                    harness.Items.pool_inputs = json.load(handle)
+            except (OSError, ValueError):
+                harness.Items.pool_inputs = {}
+            harness.Items.delta_files = frozenset(delta["files"])
+            harness.Items.delta_pinned = delta["pinned"]
         session = harness.Session()
         for number, test_id, limit in job["tests"]:
             ok = session.run(test_id, limit)

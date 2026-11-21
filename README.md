@@ -50,6 +50,16 @@ For each patch the selector does three things.
    failed once (it ran far over its time rather than giving a wrong result).
    `BR_DROP=0` turns the rule off.
 
+5. **Runs fixture-only commits on what changed.** Two SQL fixtures are read by
+   61 tests, because the executor's class setup loads them, and one of those
+   tests is the 21-second one. A commit that edits such a fixture and no code is
+   run in delta mode ([br/harness.py](br/harness.py)): a fixture loader yields
+   only the items that differ from the pinned file, and a query handed to the
+   process pool is skipped when its pickled input equals the pinned one
+   (`maps/pool_inputs.json`). Code and input being the same, those give what they
+   gave on the pinned commit. Every reader then gets its own verdict in a few
+   seconds, and only the ones that fail are kept. `BR_DELTA=0` turns it off.
+
 Whatever is kept is split longest-first across the worker count that minimises
 busiest worker + 2 s per worker.
 
@@ -93,6 +103,9 @@ python /repo/tools/class_tree.py /work/classes.json
 python /repo/tools/compile_map.py /repo/sample/tests.json /work/trace /work/timing.json /repo/maps
 cp /work/classes.json /repo/maps/classes.json
 python /repo/tools/outline.py /app/sqlglot /repo/maps
+python /repo/tools/pool_inputs.py /repo/maps/pool_inputs.json \
+  tests/test_executor.py::TestExecutor::test_execute_tpch \
+  tests/test_executor.py::TestExecutor::test_execute_tpcds
 ```
 
 ## Trying it
