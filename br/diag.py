@@ -37,8 +37,9 @@ one was. Counts and CPU seconds are given as buckets (see the code).
                      long test (1 TPC-DS, 2 max_nodes, 3 both)
   page 7  7 L K E G  first loud commit: L = which long test it keeps, K = kinds,
                      E = quick executor candidates, G as on page 6
-  page 8  8 L K D F  first quiet commit: L, K as above, D = candidates that read a
-                     changed data file, F as on page 5
+  page 8  8 C Q T E  first quiet commit: C = candidates, Q = quick code candidates,
+                     T = their CPU, E = quick executor candidates
+  page 9  9 C Q T R  first loud commit: C, Q, T as on page 8, R = tests planned
   page 6  6 N K E G  N = loud commits; the first one: K = kinds as above, E = quick
                      executor candidates, G = 1 guard set + 2 a guard test failed
                      + 4 a data file changed
@@ -93,7 +94,7 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
     seconds = [test["seconds"] for test in tests]
     commits = [path.stem for path in patches]
     if page is None:
-        page = 7 + (os.urandom(1)[0] & 1)  # the two pages that matter now
+        page = 7 + os.urandom(1)[0] % 3  # the three pages that matter now
     workers = {commit: split(sorted(answers[commit]), seconds) for commit in commits}
     before = {commit: cost_ms(workers[commit], duration) for commit in commits}
     touched: set[str] = set()
@@ -113,7 +114,8 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
     # pages 4 to 6 change no answer: they only describe the commits that keep a long test
     quiet = [c for c in commits if c not in INFO["failed"] and answers[c] & long_tests
              and not facts.get(c, {}).get("delta")]
-    loud = [c for c in commits if c in INFO["failed"] and answers[c] & long_tests]
+    loud = [c for c in commits if c in INFO["failed"] and answers[c] & long_tests
+            and not facts.get(c, {}).get("delta")]
     if page == 4:
         first = facts.get(quiet[0], {}) if quiet else {}
         digits = ((kind_bits(quiet[0]) if quiet else 0) * 1000 + count_bucket(first.get("cands", 0)) * 100
@@ -131,20 +133,21 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
                  + (4 if loud and "data" in INFO["kinds"].get(loud[0], ()) else 0))
         digits = (min(9, len(loud)) * 1000 + (kind_bits(loud[0]) if loud else 0) * 100
                   + count_bucket(first.get("exec_quick", 0)) * 10 + flags)
-    elif page in (7, 8):
-        group = loud if page == 7 else quiet
-        first = facts.get(group[0], {}) if group else {}
-        kept_long = answers[group[0]] & long_tests if group else set()
+    elif page == 7:
+        first = facts.get(loud[0], {}) if loud else {}
+        kept_long = answers[loud[0]] & long_tests if loud else set()
         which = sum(1 if seconds[n] < 25 else 2 for n in kept_long)
-        if page == 7:
-            flags = ((1 if first.get("guard") else 0)
-                     + (2 if group and group[0] in INFO.get("guard_failed", ()) else 0)
-                     + (4 if group and "data" in INFO["kinds"].get(group[0], ()) else 0))
-            third = count_bucket(first.get("exec_quick", 0))
-        else:
-            flags = (1 if first.get("drop") else 0) + (2 if first.get("ran") else 0) + (4 if first.get("guard") else 0)
-            third = count_bucket(first.get("data", 0))
-        digits = which * 1000 + (kind_bits(group[0]) if group else 0) * 100 + third * 10 + flags
+        flags = ((1 if first.get("guard") else 0)
+                 + (2 if loud and loud[0] in INFO.get("guard_failed", ()) else 0)
+                 + (4 if loud and "data" in INFO["kinds"].get(loud[0], ()) else 0))
+        digits = (which * 1000 + (kind_bits(loud[0]) if loud else 0) * 100
+                  + count_bucket(first.get("exec_quick", 0)) * 10 + flags)
+    elif page in (8, 9):
+        group = quiet if page == 8 else loud
+        first = facts.get(group[0], {}) if group else {}
+        last = count_bucket(first.get("exec_quick", 0)) if page == 8 else count_bucket(first.get("ran", 0))
+        digits = (count_bucket(first.get("cands", 0)) * 1000 + count_bucket(first.get("quick", 0)) * 100
+                  + cpu_bucket(first.get("quick_cpu", 0.0)) * 10 + last)
     elif page == 0:
         total = immediate = 0
         for commit in commits:
