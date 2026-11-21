@@ -60,6 +60,12 @@ For each patch the selector does three things.
    gave on the pinned commit. Every reader then gets its own verdict in a few
    seconds, and only the ones that fail are kept. `BR_DELTA=0` turns it off.
 
+6. **Plans the code part of a mixed commit by itself.** A commit that changes
+   code and a data file is two changes. The tests that read the data file are
+   kept without being run. Every other candidate is one only because it runs the
+   changed code, so it is planned, and the long tests let go, exactly as for a
+   commit with the code change alone. `BR_MIXED=0` turns it off.
+
 Whatever is kept is split longest-first across the worker count that minimises
 busiest worker + 2 s per worker.
 

@@ -77,6 +77,7 @@ DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "5"))
 # test gets its own verdict. Worth it once keeping the readers would cost DELTA_MIN
 # seconds. BR_DELTA=0 turns it off.
 DELTA = os.environ.get("BR_DELTA", "1") == "1"
+MIXED = os.environ.get("BR_MIXED", "1") == "1"  # plan the code part of a code-and-data commit by itself
 DELTA_MIN = float(os.environ.get("BR_DELTA_MIN", "6.0"))
 DELTA_LONG_LIMIT = 15.0  # wall seconds for a test too long to run whole; past it, it is kept
 DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
@@ -271,6 +272,7 @@ class Decision:
         self.kinds: set[str] = set()
         self.notes: list[str] = []
         self.drop_when_clean: set[int] = set()  # see DROP: long tests to let go, set by plan()
+        self.data_candidates: set[int] = set()  # candidates because they read a changed data file
         self.delta_files: list[str] = []  # SQL fixtures edited in place
         self.delta = False  # see DELTA: nothing but those changed
         self.delta_run = False  # set by plan(): run every candidate in delta mode
@@ -309,6 +311,7 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
                     listers = maps.listers(os.path.dirname(path))
                     if listers:
                         decision.candidates |= listers
+                        decision.data_candidates |= listers
                         decision.kinds.add("data")
 
         old_text = read_pinned(old_path) if old_path is not None else None
@@ -321,6 +324,7 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
             decision.runnable = False
             if old_path is not None and maps.readers(old_path):
                 decision.candidates |= maps.readers(old_path)
+                decision.data_candidates |= maps.readers(old_path)
                 decision.kinds.add("data")
             if (old_path or "").endswith(".py") or (new_path or "").endswith(".py"):
                 decision.everything = True
@@ -339,6 +343,7 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
             readers = maps.readers(old_path)
             if readers:
                 decision.candidates |= readers
+                decision.data_candidates |= readers
                 decision.kinds.add("data")
         if old_path is not None and old_path != new_path:
             decision.files[old_path] = None
@@ -439,7 +444,22 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
             # Longest first: in delta mode a long test costs little to run, and once
             # one is known to fail the shorter ones may fit beside it for free.
             return sorted(candidates, key=lambda n: (-seconds[n], n))
-    if DROP and "data" not in decision.kinds:
+    # A commit that changes both code and data files is two changes. A test that reads
+    # a changed data file is kept and left alone: the file probably breaks it, and its
+    # verdict says nothing about the code. Every other candidate is one only because
+    # it runs changed code, cannot be touched by the data change, and is planned as it
+    # would be if the code change stood alone.
+    kinds = set(decision.kinds)
+    fixed: list[int] = []
+    if "data" in kinds and len(kinds) > 1 and MIXED:
+        fixed = sorted(decision.data_candidates & decision.candidates)
+        candidates = [n for n in candidates if n not in decision.data_candidates]
+        kinds.discard("data")
+        if not candidates:
+            return []
+    fixed_total = sum(seconds[n] for n in fixed)
+    fixed_big = max((seconds[n] for n in fixed), default=0.0)
+    if DROP and "data" not in kinds:
         long_tests = {n for n in candidates if seconds[n] >= BIG_SECONDS and run_cost[n] > LONG_CPU}
         if long_tests:
             def by_cost(n):
@@ -472,7 +492,7 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
                 decision.drop_when_clean = long_tests
                 return to_run
     p, q = 0.0, 0.0
-    for kind in decision.kinds:
+    for kind in kinds:
         kind_p, kind_q = PRIOR[kind]
         p = 1 - (1 - p) * (1 - kind_p)
         q = max(q, kind_q)
@@ -496,7 +516,7 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
     for i in range(count - 1, -1, -1):
         suffix_total[i] = suffix_total[i + 1] + seconds[order[i]]
         suffix_big[i] = max(suffix_big[i + 1], seconds[order[i]])
-    keep_all = approx_split(suffix_total[0], suffix_big[0])
+    keep_all = approx_split(suffix_total[0] + fixed_total, max(suffix_big[0], fixed_big))
 
     best_k, best_cost = 0, keep_all
     spent = 0.0  # CPU to run the first k
@@ -509,7 +529,7 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
         spent += step
         until_failure += step * survive
         survive *= 1 - q
-        harmless = JOB_BASE + spent + approx_split(suffix_total[k], suffix_big[k])
+        harmless = JOB_BASE + spent + approx_split(suffix_total[k] + fixed_total, max(suffix_big[k], fixed_big))
         harmful = JOB_BASE + until_failure + keep_all
         expected = (1 - p) * harmless + p * harmful
         if expected < best_cost - 1e-9:
