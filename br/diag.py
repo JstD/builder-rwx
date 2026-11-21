@@ -94,7 +94,7 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
     seconds = [test["seconds"] for test in tests]
     commits = [path.stem for path in patches]
     if page is None:
-        page = 7 + os.urandom(1)[0] % 3  # the three pages that matter now
+        page = 4 + os.urandom(1)[0] % 3  # pages 4 to 6 now say where the CPU goes
     workers = {commit: split(sorted(answers[commit]), seconds) for commit in commits}
     before = {commit: cost_ms(workers[commit], duration) for commit in commits}
     touched: set[str] = set()
@@ -116,23 +116,24 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
              and not facts.get(c, {}).get("delta")]
     loud = [c for c in commits if c in INFO["failed"] and answers[c] & long_tests
             and not facts.get(c, {}).get("delta")]
+    jobs = INFO.get("jobs", [])
     if page == 4:
-        first = facts.get(quiet[0], {}) if quiet else {}
-        digits = ((kind_bits(quiet[0]) if quiet else 0) * 1000 + count_bucket(first.get("cands", 0)) * 100
-                  + count_bucket(first.get("data", 0)) * 10 + min(9, len(quiet)))
+        # CPU before any test ran, in half seconds; jobs; jobs that saw a failure
+        digits = (min(9, round(INFO.get("fixed_cpu", 0.0) * 2)) * 1000 + min(99, len(jobs)) * 10
+                  + min(9, sum(1 for job in jobs if job["failed"])))
     elif page == 5:
-        first = facts.get(quiet[0], {}) if quiet else {}
-        flags = (1 if first.get("drop") else 0) + (2 if first.get("ran") else 0) + (4 if first.get("guard") else 0)
-        kept_long = answers[quiet[0]] & long_tests if quiet else set()
-        which = sum(1 if seconds[n] < 25 else 2 for n in kept_long)
-        digits = (count_bucket(first.get("quick", 0)) * 1000 + cpu_bucket(first.get("quick_cpu", 0.0)) * 100
-                  + flags * 10 + min(9, which))
+        # seconds spent in jobs that saw a failure, and in jobs that did not
+        digits = (min(99, round(sum(job["wall"] for job in jobs if job["failed"]))) * 100
+                  + min(99, round(sum(job["wall"] for job in jobs if not job["failed"]))))
     elif page == 6:
-        first = facts.get(loud[0], {}) if loud else {}
-        flags = ((1 if first.get("guard") else 0) + (2 if loud and loud[0] in INFO.get("guard_failed", ()) else 0)
-                 + (4 if loud and "data" in INFO["kinds"].get(loud[0], ()) else 0))
-        digits = (min(9, len(loud)) * 1000 + (kind_bits(loud[0]) if loud else 0) * 100
-                  + count_bucket(first.get("exec_quick", 0)) * 10 + flags)
+        # the three longest jobs, in seconds, and what the longest one was
+        top = sorted(jobs, key=lambda job: -job["wall"])[:3]
+        walls = [min(9, round(job["wall"])) for job in top] + [0, 0, 0]
+        kind = 0
+        if top:
+            kind = 1 if top[0]["delta"] else 2 if top[0]["guard"] else 3 if top[0]["drop"] else 4
+            kind += 4 if top[0]["failed"] else 0
+        digits = walls[0] * 1000 + walls[1] * 100 + walls[2] * 10 + kind
     elif page == 7:
         first = facts.get(loud[0], {}) if loud else {}
         kept_long = answers[loud[0]] & long_tests if loud else set()

@@ -697,6 +697,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
     heavy = sum(1 for _, to_run in jobs if any(tests[n]["file"] in HEAVY_FILES for n in to_run))
     runner.preload(heavy=heavy >= 2)
     log(f"preloaded: {sum(os.times()[:4]):.2f}s cpu so far")
+    DIAG_INFO["fixed_cpu"] = sum(os.times()[:4])
     os.makedirs(WORK, exist_ok=True)
 
     # A warm slot has sqlglot's core imported already, from the pinned checkout. A
@@ -843,6 +844,11 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                                     f"{tests[long_test]['id']}")
                                 answers[decision.commit].discard(long_test)
                                 DIAG_INFO["guard_drops"] += 1
+                        DIAG_INFO.setdefault("jobs", []).append({
+                            "commit": decision.commit, "wall": time.monotonic() - handle["since"],
+                            "failed": bool(handle["failed"]), "delta": decision.delta_run,
+                            "guard": bool(decision.guards), "drop": bool(decision.drop_when_clean),
+                            "ran": handle["ran"]})
                         log(f"{handle['decision'].commit}: ran {handle['ran']}/{handle['planned']} in "
                             f"{time.monotonic() - handle['since']:.2f}s (expected {handle['expected']:.2f}s)")
                         runner.remove_overlay(handle["root"])
