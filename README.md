@@ -93,12 +93,12 @@ The TPC-DS executor test is run this way when its affected queries cost at most
 whole runs on practice commits: 656 trimmed runs of the mid-cost tests and 171
 of the TPC-DS test, every verdict the same. `BR_ITEMS=0` turns it off.
 
-One cost is shared between jobs. The executor's test class parses 32 CSV tables
-in its `setUpClass`, about a second of CPU in every job that runs one of its
-tests. The rows depend only on those files, so they are parsed once before the
-workers fork, and a job whose patch touches nothing under `tests/` builds the
-class from them; the rest of the setup runs as written, on the patched code
-(`harness.SharedTables`, checked equal to the real setup value by value).
+One idea is in the code but switched off. The executor's test class parses 32
+CSV tables in its `setUpClass`, about a second of CPU in every job that runs one
+of its tests, and the rows could be parsed once before the workers fork
+(`harness.SharedTables`, `BR_SHARE_TABLES=1`). Locally that saves CPU. On the
+scorer the one run in which it took effect used 5 more CPU seconds: each job
+that uses the shared rows has to copy the memory pages they sit on.
 
 Whatever is kept is split longest-first across the worker count that minimises
 busiest worker + 2 s per worker.

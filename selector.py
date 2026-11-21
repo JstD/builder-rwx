@@ -94,7 +94,10 @@ DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
 # or more from its file: the guard passed 127 times and the long test still failed
 # in 5. TPC-DS, fewer than three: 40 times, 0 failed. test_max_nodes: 21 times, 0.
 GUARD = os.environ.get("BR_GUARD", "1") == "1"
-SHARE_TABLES = os.environ.get("BR_SHARE_TABLES", "1") == "1"  # see harness.SharedTables
+# Off: see harness.SharedTables. It saves CPU where this was developed, but on the
+# scorer the one run in which it took effect used 5 more CPU seconds, not fewer:
+# every job that uses the shared rows has to copy the pages they sit on.
+SHARE_TABLES = os.environ.get("BR_SHARE_TABLES", "0") == "1"
 
 # An exact answer for a long test that is one loop over independent items (the
 # executor's TPC-DS test and its 99 queries). maps/items.json says which items run
