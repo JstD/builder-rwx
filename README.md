@@ -44,11 +44,35 @@ For each patch the selector does three things.
    commit. When one is a candidate for a code change, the quick candidates are run
    as evidence (at least five, 0.3 s each at most), then others while the job
    stays within 6 CPU seconds. If nothing fails, the two long ones are dropped
-   unrun; anything else not run is kept. This is the only place the selector
-   accepts a risk of missing a failure. Measured on 514 practice commits made on
+   unrun; anything else not run is kept. This and the guard below are the only places
+   the selector accepts a risk of missing a failure. Measured on 514 practice commits made on
    lines those tests execute: the evidence passed 85 times and a long test then
    failed once (it ran far over its time rather than giving a wrong result).
    `BR_DROP=0` turns the rule off.
+
+   The TPC-DS executor test can also go when something unrelated failed. Its
+   guard is the quick candidates from the executor's test file (at least three)
+   plus the optimizer's TPC-H test when that is a candidate. If the whole guard
+   passes, the test is let go. A failure among the other tests then ends only
+   the other tests; the guard still runs. This is a second accepted risk: on 127
+   practice commits where the guard passed, the long test still failed in 5.
+   `BR_GUARD=0` turns it off.
+
+5. **Runs fixture-only commits on what changed.** Two SQL fixtures are read by
+   61 tests, because the executor's class setup loads them, and one of those
+   tests is the 21-second one. A commit that edits such a fixture and no code is
+   run in delta mode ([br/harness.py](br/harness.py)): a fixture loader yields
+   only the items that differ from the pinned file, and a query handed to the
+   process pool is skipped when its pickled input equals the pinned one
+   (`maps/pool_inputs.json`). Code and input being the same, those give what they
+   gave on the pinned commit. Every reader then gets its own verdict in a few
+   seconds, and only the ones that fail are kept. `BR_DELTA=0` turns it off.
+
+6. **Plans the code part of a mixed commit by itself.** A commit that changes
+   code and a data file is two changes. The tests that read the data file are
+   kept without being run. Every other candidate is one only because it runs the
+   changed code, so it is planned, and the long tests let go, exactly as for a
+   commit with the code change alone. `BR_MIXED=0` turns it off.
 
 Whatever is kept is split longest-first across the worker count that minimises
 busiest worker + 2 s per worker.
@@ -93,6 +117,9 @@ python /repo/tools/class_tree.py /work/classes.json
 python /repo/tools/compile_map.py /repo/sample/tests.json /work/trace /work/timing.json /repo/maps
 cp /work/classes.json /repo/maps/classes.json
 python /repo/tools/outline.py /app/sqlglot /repo/maps
+python /repo/tools/pool_inputs.py /repo/maps/pool_inputs.json \
+  tests/test_executor.py::TestExecutor::test_execute_tpch \
+  tests/test_executor.py::TestExecutor::test_execute_tpcds
 ```
 
 ## Trying it

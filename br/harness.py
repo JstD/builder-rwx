@@ -19,7 +19,9 @@ the others need to run to know the test's verdict.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import os
 import pickle
 import signal
 import sys
@@ -49,6 +51,17 @@ class Items:
     only_loader = None  # fixture -> indices allowed, or None for all
     on_switch = None  # the tracer's callback(key)
 
+    # Delta mode, for a commit that changes fixture files and no code. Whatever a
+    # test does with an item it was also given on the pinned commit, it does as it
+    # did there. So a loader yields only the items of a changed file that differ
+    # from the pinned file, and a pool task whose pickled input equals the pinned
+    # one is not run.
+    delta_pinned = None  # the pinned checkout, when delta mode is on
+    delta_files = frozenset()  # changed files, relative to the checkout
+    pool_inputs = {}  # test id -> {"init": digest, "tasks": [digest, ...]} on the pinned commit
+    test_id = None
+    record = None  # a list: pool inputs are recorded here instead of being run
+
     @classmethod
     def switch(cls, key):
         if key != cls.current:
@@ -57,8 +70,9 @@ class Items:
                 cls.on_switch(key)
 
     @classmethod
-    def begin(cls, only=None):
-        cls.active = cls.enabled or only is not None
+    def begin(cls, only=None, test_id=None):
+        cls.test_id = test_id
+        cls.active = cls.enabled or only is not None or cls.delta_pinned is not None or cls.record is not None
         if not cls.active:
             return
         cls.submitted = 0
@@ -84,6 +98,8 @@ def wrap_loader(loader):
         allowed = None
         if Items.active and Items.only_loader is not None:
             allowed = Items.only_loader.get(filename, ())
+        elif Items.active and Items.delta_pinned is not None:
+            allowed = _changed_items(loader, filename, args, kwargs)
         for index, item in enumerate(loader(filename, *args, **kwargs)):
             if allowed is not None and index not in allowed:
                 continue
@@ -97,6 +113,37 @@ def wrap_loader(loader):
     return wrapped
 
 
+def _changed_items(loader, filename, args, kwargs):
+    """Indices of the items the loader gives now that it did not give, in the same
+    place, from the pinned file. None when that cannot be worked out, and then
+    every item counts."""
+    scope = getattr(loader, "__globals__", {})
+    directory = scope.get("FIXTURES_DIR")
+    if not isinstance(directory, str):
+        return None
+    relative = os.path.relpath(os.path.join(directory, filename), os.getcwd()).replace(os.sep, "/")
+    if relative not in Items.delta_files:
+        return None
+    try:
+        new = list(loader(filename, *args, **kwargs))
+        scope["FIXTURES_DIR"] = os.path.join(Items.delta_pinned, os.path.relpath(directory, os.getcwd()))
+        try:
+            old = list(loader(filename, *args, **kwargs))
+        finally:
+            scope["FIXTURES_DIR"] = directory
+    except Abort:
+        raise
+    except BaseException:
+        return None
+    if len(old) != len(new):
+        return None
+    return {index for index, (a, b) in enumerate(zip(old, new)) if a != b}
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha1(data).hexdigest()
+
+
 class InlinePool:
     """A drop-in for ProcessPoolExecutor that runs each task at submit time.
 
@@ -108,6 +155,7 @@ class InlinePool:
         self._initializer = initializer
         self._initargs = initargs
         self._ready = False
+        self._init_digest = None
 
     def _start(self):
         if not self._ready:
@@ -129,6 +177,10 @@ class InlinePool:
                     # it gave on the pinned commit. The tests take None as "no result".
                     future.set_result(None)
                     return future
+                if Items.record is not None or Items.delta_pinned is not None:
+                    if self._same_as_pinned(future.item[1], fn, args, kwargs):
+                        future.set_result(None)
+                        return future
                 Items.switch(future.item)
         try:
             self._start()
@@ -142,6 +194,26 @@ class InlinePool:
             if Items.active:
                 Items.switch(outer)
         return future
+
+    def _same_as_pinned(self, index, fn, args, kwargs) -> bool:
+        """Whether this task has the input it had on the pinned commit (and so the
+        result). When recording, notes the input and says yes, so nothing runs."""
+        try:
+            task = _digest(pickle.dumps((fn, args, kwargs)))
+            if self._init_digest is None:
+                self._init_digest = _digest(pickle.dumps(self._initargs))
+        except Abort:
+            raise
+        except BaseException:
+            return False
+        if Items.record is not None:
+            Items.record.append((Items.test_id, index, self._init_digest, task))
+            return True
+        known = Items.pool_inputs.get(Items.test_id)
+        if not known or known.get("init") != self._init_digest:
+            return False
+        tasks = known.get("tasks", ())
+        return index < len(tasks) and tasks[index] == task
 
     def map(self, fn, *iterables, timeout=None, chunksize=1):
         futures = [self.submit(fn, *args) for args in zip(*iterables)]
@@ -273,7 +345,7 @@ class Session:
             if not self.setup_class(file, cls_name):
                 return False
             verdict = _Verdict()
-            Items.begin(only)
+            Items.begin(only, test_id)
             try:
                 cls(method).run(verdict)
             finally:

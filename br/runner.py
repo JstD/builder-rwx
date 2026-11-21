@@ -147,11 +147,40 @@ def _work(job: dict, out_fd: int):
             os.write(out_fd, b"P %d\n" % (1 if ok else 0))
             if not ok:
                 os._exit(0)
+        delta = job.get("delta")
+        if delta:
+            # fixtures changed and no code: tests run only on what differs (harness.Items)
+            try:
+                with open(delta["pool"], encoding="utf-8") as handle:
+                    harness.Items.pool_inputs = json.load(handle)
+            except (OSError, ValueError):
+                harness.Items.pool_inputs = {}
+            harness.Items.delta_files = frozenset(delta["files"])
+            harness.Items.delta_pinned = delta["pinned"]
         session = harness.Session()
-        for number, test_id, limit in job["tests"]:
+        weights = (delta or {}).get("seconds") or []
+        costs = (delta or {}).get("cost") or []
+        longest_failed = 0.0
+        stopping = job.get("stop", True)
+        # When stopping: a failure ends the ordinary tests, since the rest of them
+        # are kept anyway. Guard tests (flagged) still run, until one of them fails:
+        # together they decide whether a long test is kept.
+        failed = guard_failed = False
+        for position, (number, test_id, limit, *flags) in enumerate(job["tests"]):
+            guard = bool(flags and flags[0])
+            if stopping and (guard_failed if guard else failed):
+                continue
             ok = session.run(test_id, limit)
             os.write(out_fd, b"R %d %d\n" % (number, 1 if ok else 0))
-            if not ok and job.get("stop", True):
+            if not ok and stopping:
+                failed = True
+                guard_failed = guard_failed or guard
+                continue
+            if not ok and position < len(weights):
+                longest_failed = max(longest_failed, weights[position])
+            if longest_failed and sum(weights[position + 1:]) <= longest_failed and sum(costs[position + 1:]) > 1.5:
+                # What is left fits on one more worker beside the failing test, for
+                # 2 seconds; running it would cost more than that.
                 break
     except BaseException:
         pass

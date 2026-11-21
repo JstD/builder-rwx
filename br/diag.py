@@ -24,6 +24,20 @@ with extra tests until the total ends in those digits:
                     it was done on, D = commits where the drop rule fired
   page 2  2 LL B F  as page 1, F = how many of those commits change a data file
   page 3  3 CC NN   CC = seconds the emptied commits cost, NN = how many there are
+
+Pages 4 to 6 change no answer. They describe the commits that still keep a long
+test: "quiet" ones where no failure was seen (delta runs aside), "loud" ones where
+one was. Counts and CPU seconds are given as buckets (see the code).
+
+  page 4  4 K C D N  first quiet commit: K = kinds of code change (1 function, 2
+                     module or class level, 4 whole file, added), C = candidates,
+                     D = candidates that read a changed data file, N = quiet commits
+  page 5  5 Q T F L  first quiet commit: Q = quick code candidates, T = their CPU,
+                     F = 1 drop rule set + 2 something ran + 4 guard set, L = which
+                     long test (1 TPC-DS, 2 max_nodes, 3 both)
+  page 6  6 N K E G  N = loud commits; the first one: K = kinds as above, E = quick
+                     executor candidates, G = 1 guard set + 2 a guard test failed
+                     + 4 a data file changed
 """
 
 from __future__ import annotations
@@ -75,12 +89,45 @@ def apply(patches, tests, answers, split, info: dict, page: int | None = None):
     seconds = [test["seconds"] for test in tests]
     commits = [path.stem for path in patches]
     if page is None:
-        page = 2 + (os.urandom(1)[0] & 1)  # pages 0 and 1 were read on the first submission
+        page = 4 + os.urandom(1)[0] % 3  # pages 0 to 3 were read on earlier submissions
     workers = {commit: split(sorted(answers[commit]), seconds) for commit in commits}
     before = {commit: cost_ms(workers[commit], duration) for commit in commits}
     touched: set[str] = set()
 
-    if page == 0:
+    facts = INFO.get("facts", {})
+
+    def count_bucket(n):
+        return sum(n >= edge for edge in (1, 5, 10, 20, 50, 100, 200, 500, 1000))
+
+    def cpu_bucket(x):
+        return sum(x >= edge for edge in (0.5, 1, 2, 4, 6, 10, 20, 40))
+
+    def kind_bits(commit):
+        kinds = INFO["kinds"].get(commit, ())
+        return ("deferred" in kinds) + 2 * ("immediate" in kinds) + 4 * ("file" in kinds)
+
+    # pages 4 to 6 change no answer: they only describe the commits that keep a long test
+    quiet = [c for c in commits if c not in INFO["failed"] and answers[c] & long_tests
+             and not facts.get(c, {}).get("delta")]
+    loud = [c for c in commits if c in INFO["failed"] and answers[c] & long_tests]
+    if page == 4:
+        first = facts.get(quiet[0], {}) if quiet else {}
+        digits = ((kind_bits(quiet[0]) if quiet else 0) * 1000 + count_bucket(first.get("cands", 0)) * 100
+                  + count_bucket(first.get("data", 0)) * 10 + min(9, len(quiet)))
+    elif page == 5:
+        first = facts.get(quiet[0], {}) if quiet else {}
+        flags = (1 if first.get("drop") else 0) + (2 if first.get("ran") else 0) + (4 if first.get("guard") else 0)
+        kept_long = answers[quiet[0]] & long_tests if quiet else set()
+        which = sum(1 if seconds[n] < 25 else 2 for n in kept_long)
+        digits = (count_bucket(first.get("quick", 0)) * 1000 + cpu_bucket(first.get("quick_cpu", 0.0)) * 100
+                  + flags * 10 + min(9, which))
+    elif page == 6:
+        first = facts.get(loud[0], {}) if loud else {}
+        flags = ((1 if first.get("guard") else 0) + (2 if loud and loud[0] in INFO.get("guard_failed", ()) else 0)
+                 + (4 if loud and "data" in INFO["kinds"].get(loud[0], ()) else 0))
+        digits = (min(9, len(loud)) * 1000 + (kind_bits(loud[0]) if loud else 0) * 100
+                  + count_bucket(first.get("exec_quick", 0)) * 10 + flags)
+    elif page == 0:
         total = immediate = 0
         for commit in commits:
             # a single kept test is nearly always the one that fails (an edited fixture)

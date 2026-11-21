@@ -73,7 +73,31 @@ DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "5"))
 
 # This branch answers with a diagnostic (see br/diag.py); BR_DIAG=0 gives the normal answer.
 DIAG = os.environ.get("BR_DIAG", "1") == "1"
-DIAG_INFO: dict = {"failed": set(), "kinds": {}, "drops": 0, "long": set()}
+DIAG_INFO: dict = {"failed": set(), "kinds": {}, "drops": 0, "long": set(), "facts": {}, "guard_drops": 0}
+# A commit that edits SQL fixtures and no code is run in delta mode (see
+# br/harness.py): each test that reads a changed fixture runs only on the items that
+# differ from the pinned file, which takes a fraction of the whole test, and every
+# test gets its own verdict. Worth it once keeping the readers would cost DELTA_MIN
+# seconds. BR_DELTA=0 turns it off.
+DELTA = os.environ.get("BR_DELTA", "1") == "1"
+MIXED = os.environ.get("BR_MIXED", "1") == "1"  # plan the code part of a code-and-data commit by itself
+DELTA_MIN = float(os.environ.get("BR_DELTA_MIN", "6.0"))
+DELTA_LONG_LIMIT = 15.0  # wall seconds for a test too long to run whole; past it, it is kept
+DELTA_ITEM_COST = 1.5  # a guess at the CPU a long test takes in delta mode
+
+# A second way to let a long test go, accepted as a risk (BR_GUARD=0 turns it off).
+# It covers the one long test it was measured on, the executor's TPC-DS test. Its
+# guard is the quick candidates from its own test file plus the cheap candidates
+# that read a SQL fixture it reads (the optimizer's TPC-H test). With at least
+# GUARD_MIN quick ones from its file, and the whole guard passing, the long test is
+# let go even though some other candidate failed. On 127 practice commits where the
+# guard passed, the long test still failed in 5.
+GUARD = os.environ.get("BR_GUARD", "1") == "1"
+GUARD_FILES = ("tests/test_executor.py",)
+GUARD_MIN = 3
+GUARD_SHARE_CPU = 1.0  # a fixture-sharing test joins the guard when it costs no more than this
+GUARD_GAIN = 6.0  # seconds letting the long test go must save for the guard to be run
+
 WARM = os.environ.get("BR_WARM", "1") == "1"  # start workers from a pre-imported sqlglot core
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
 MAX_SINGLE_RUN = 10.0  # CPU seconds; two workers share 4 GB and the giants use over 1 GB
@@ -100,6 +124,7 @@ class Maps:
         self.cov: dict[str, dict | None] = {}
         self.importers = None
         self.outlines = None
+        self.opened = None  # test -> files it opens, made on first need
         self.tree = None  # ClassTree and readers.Finder, made on first need
         self.finder = None
         # the maps number tests as the pinned tests.json did; translate by id
@@ -173,6 +198,15 @@ class Maps:
     def readers(self, path: str) -> set[int]:
         runs = self.index["opens"].get(path)
         return self.tests(runs) if runs else set()
+
+    def opened_by(self, number: int) -> list[str]:
+        """Files the test opens as data."""
+        if self.opened is None:
+            self.opened = {}
+            for path, runs in self.index["opens"].items():
+                for test in self.tests(runs):
+                    self.opened.setdefault(test, []).append(path)
+        return self.opened.get(number, [])
 
     def listers(self, directory: str) -> set[int]:
         runs = self.index["dirs"].get(directory)
@@ -264,6 +298,11 @@ class Decision:
         self.kinds: set[str] = set()
         self.notes: list[str] = []
         self.drop_when_clean: set[int] = set()  # see DROP: long tests to let go, set by plan()
+        self.data_candidates: set[int] = set()  # candidates because they read a changed data file
+        self.guards: dict[int, set[int]] = {}  # see GUARD: long test -> the tests that vouch for it
+        self.delta_files: list[str] = []  # SQL fixtures edited in place
+        self.delta = False  # see DELTA: nothing but those changed
+        self.delta_run = False  # set by plan(): run every candidate in delta mode
 
 
 def read_pinned(path: str) -> str | None:
@@ -277,6 +316,7 @@ def read_pinned(path: str) -> str | None:
 def analyse(commit: str, text: str, maps: Maps) -> Decision:
     decision = Decision(commit)
     import_reads: set[str] = set()
+    other_changes = False
     for file_patch in patchlib.parse(text):
         old_path, new_path = file_patch.old_path, file_patch.new_path
         if old_path is None and new_path is None:
@@ -298,6 +338,7 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
                     listers = maps.listers(os.path.dirname(path))
                     if listers:
                         decision.candidates |= listers
+                        decision.data_candidates |= listers
                         decision.kinds.add("data")
 
         old_text = read_pinned(old_path) if old_path is not None else None
@@ -310,6 +351,7 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
             decision.runnable = False
             if old_path is not None and maps.readers(old_path):
                 decision.candidates |= maps.readers(old_path)
+                decision.data_candidates |= maps.readers(old_path)
                 decision.kinds.add("data")
             if (old_path or "").endswith(".py") or (new_path or "").endswith(".py"):
                 decision.everything = True
@@ -319,11 +361,16 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
             decision.files[new_path] = new_text
         if old_path == new_path and new_text == old_text:
             continue  # nothing in the file changed (a mode change, say)
+        if old_path == new_path and old_path.startswith("tests/fixtures/") and old_path.endswith(".sql"):
+            decision.delta_files.append(old_path)
+        else:
+            other_changes = True
         if old_path is not None:
             # tests that read the old file as data see any change to it
             readers = maps.readers(old_path)
             if readers:
                 decision.candidates |= readers
+                decision.data_candidates |= readers
                 decision.kinds.add("data")
         if old_path is not None and old_path != new_path:
             decision.files[old_path] = None
@@ -375,6 +422,8 @@ def analyse(commit: str, text: str, maps: Maps) -> Decision:
                 module = module[: -len(".__init__")]
             if module not in decision.probe:
                 decision.probe.append(module)
+    decision.delta = (bool(decision.delta_files) and not other_changes and decision.runnable
+                      and not decision.everything and decision.kinds == {"data"})
     if decision.candidates:
         decision.candidates |= maps.unknown
     if decision.broad:
@@ -407,14 +456,91 @@ def split(tests: list[int], seconds: list[float]) -> list[list[int]]:
     return best[1]
 
 
+def guards_for(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
+               maps) -> dict[int, set[int]]:
+    """Long test -> its guard, for the long candidates the GUARD rule covers."""
+    found: dict[int, set[int]] = {}
+    if not GUARD or maps is None or not decision.runnable or decision.everything:
+        return found
+    # a test that reads a changed data file is no evidence about the code, and no
+    # long test that reads one is let go
+    candidates = decision.candidates - decision.data_candidates
+    for long_test in candidates:
+        if seconds[long_test] < BIG_SECONDS or run_cost[long_test] <= LONG_CPU:
+            continue
+        home = tests[long_test]["file"]
+        if home not in GUARD_FILES:
+            continue
+        guard = {n for n in candidates
+                 if n != long_test and tests[n]["file"] == home and run_cost[n] <= EVIDENCE_CPU}
+        if len(guard) < GUARD_MIN:
+            continue
+        for path in maps.opened_by(long_test):
+            if path.endswith(".sql"):
+                guard |= {n for n in maps.readers(path) & candidates
+                          if n != long_test and run_cost[n] <= GUARD_SHARE_CPU}
+        found[long_test] = guard
+    return found
+
+
 def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
-         setup_cost: dict[str, float]) -> list[int]:
-    """The candidates worth running, in order. Empty means keep them all unrun."""
+         setup_cost: dict[str, float], maps=None) -> list[int]:
+    """The candidates worth running, in order. Empty means keep them all unrun.
+
+    Guard tests (``decision.guards``) come last. A failure among the other tests
+    ends the other tests only; the guard still runs, until one of its own fails."""
+    decision.guards = {}
+    to_run = _plan(decision, tests, seconds, run_cost, setup_cost)
+    if decision.delta_run:
+        return to_run
+    guards = guards_for(decision, tests, seconds, run_cost, maps)
+    if not guards:
+        return to_run
+    kept = sorted(decision.candidates)
+    without = [n for n in kept if n not in guards]
+    saving = (approx_split(sum(seconds[n] for n in kept), max(seconds[n] for n in kept))
+              - (approx_split(sum(seconds[n] for n in without), max(seconds[n] for n in without)) if without else 0.0))
+    if saving < GUARD_GAIN:
+        return to_run  # another long test stays anyway: nothing to gain
+    decision.guards = guards
+    guard_tests = set().union(*guards.values())
+
+    def by_cost(n):
+        return (setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0) > 0.5, run_cost[n], n)
+
+    return [n for n in to_run if n not in guard_tests] + sorted(guard_tests, key=by_cost)
+
+
+def _plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: list[float],
+          setup_cost: dict[str, float]) -> list[int]:
     candidates = sorted(decision.candidates)
     decision.drop_when_clean = set()
+    decision.delta_run = False
     if not candidates or not decision.runnable or decision.everything:
         return []
-    if DROP and "data" not in decision.kinds:
+    if DELTA and decision.delta:
+        keep_all = approx_split(sum(seconds[n] for n in candidates), max(seconds[n] for n in candidates))
+        if keep_all >= DELTA_MIN:
+            decision.delta_run = True
+            # Longest first: in delta mode a long test costs little to run, and once
+            # one is known to fail the shorter ones may fit beside it for free.
+            return sorted(candidates, key=lambda n: (-seconds[n], n))
+    # A commit that changes both code and data files is two changes. A test that reads
+    # a changed data file is kept and left alone: the file probably breaks it, and its
+    # verdict says nothing about the code. Every other candidate is one only because
+    # it runs changed code, cannot be touched by the data change, and is planned as it
+    # would be if the code change stood alone.
+    kinds = set(decision.kinds)
+    fixed: list[int] = []
+    if "data" in kinds and len(kinds) > 1 and MIXED:
+        fixed = sorted(decision.data_candidates & decision.candidates)
+        candidates = [n for n in candidates if n not in decision.data_candidates]
+        kinds.discard("data")
+        if not candidates:
+            return []
+    fixed_total = sum(seconds[n] for n in fixed)
+    fixed_big = max((seconds[n] for n in fixed), default=0.0)
+    if DROP and "data" not in kinds:
         long_tests = {n for n in candidates if seconds[n] >= BIG_SECONDS and run_cost[n] > LONG_CPU}
         if long_tests:
             def by_cost(n):
@@ -447,7 +573,7 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
                 decision.drop_when_clean = long_tests
                 return to_run
     p, q = 0.0, 0.0
-    for kind in decision.kinds:
+    for kind in kinds:
         kind_p, kind_q = PRIOR[kind]
         p = 1 - (1 - p) * (1 - kind_p)
         q = max(q, kind_q)
@@ -471,7 +597,7 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
     for i in range(count - 1, -1, -1):
         suffix_total[i] = suffix_total[i + 1] + seconds[order[i]]
         suffix_big[i] = max(suffix_big[i + 1], seconds[order[i]])
-    keep_all = approx_split(suffix_total[0], suffix_big[0])
+    keep_all = approx_split(suffix_total[0] + fixed_total, max(suffix_big[0], fixed_big))
 
     best_k, best_cost = 0, keep_all
     spent = 0.0  # CPU to run the first k
@@ -484,7 +610,7 @@ def plan(decision: Decision, tests: list[dict], seconds: list[float], run_cost: 
         spent += step
         until_failure += step * survive
         survive *= 1 - q
-        harmless = JOB_BASE + spent + approx_split(suffix_total[k], suffix_big[k])
+        harmless = JOB_BASE + spent + approx_split(suffix_total[k] + fixed_total, max(suffix_big[k], fixed_big))
         harmful = JOB_BASE + until_failure + keep_all
         expected = (1 - p) * harmless + p * harmful
         if expected < best_cost - 1e-9:
@@ -518,7 +644,16 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             continue
         answers[commit] = set(decision.candidates)
         DIAG_INFO["kinds"][commit] = set(decision.kinds)
-        to_run = plan(decision, tests, seconds, run_cost, setup_cost)
+        to_run = plan(decision, tests, seconds, run_cost, setup_cost, maps)
+        quick = [n for n in decision.candidates - decision.data_candidates if run_cost[n] <= EVIDENCE_CPU]
+        DIAG_INFO["facts"][commit] = {
+            "cands": len(decision.candidates),
+            "data": len(decision.data_candidates & decision.candidates),
+            "quick": len(quick), "quick_cpu": sum(run_cost[n] for n in quick),
+            "exec_quick": sum(1 for n in quick if tests[n]["file"] == "tests/test_executor.py"),
+            "drop": bool(decision.drop_when_clean), "guard": bool(decision.guards),
+            "ran": len(to_run), "delta": decision.delta_run, "runnable": decision.runnable,
+        }
         log(f"{commit}: {len(decision.candidates)} candidates, running {len(to_run)} "
             f"[{' '.join(sorted(decision.kinds))}] {'; '.join(decision.notes)}")
         if to_run or decision.probe:
@@ -600,17 +735,26 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             # A test's limit is generous (a timeout only ever keeps tests) and must
             # cover what the first test of a class also pays for: importing the test
             # module and its setUpClass, which for the executor loads every table.
-            limits = [
-                (n, tests[n]["id"],
-                 round(6 * (run_cost[n] + setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0)) + 5.0 * SPEED, 2))
-                for n in to_run
-            ]
-            wall = min(sum(limit for _, _, limit in limits) + 10.0, max(5.0, deadline - time.monotonic()))
-            slot.submit({"root": root, "tests": limits, "stop": True, "wall": wall + 20.0,
-                         "probe": decision.probe, "warm": slot.warm},
+            def limit_for(n):
+                setup = setup_cost.get(tests[n]["id"].rsplit("::", 1)[0], 0.0)
+                if decision.delta_run and run_cost[n] > MAX_SINGLE_RUN:
+                    return round(DELTA_LONG_LIMIT * max(1.0, SPEED) + 6 * setup, 2)
+                return round(6 * (run_cost[n] + setup) + 5.0 * SPEED, 2)
+
+            guard_tests = set().union(*decision.guards.values()) if decision.guards else set()
+            limits = [(n, tests[n]["id"], limit_for(n), 1 if n in guard_tests else 0) for n in to_run]
+            wall = min(sum(limit for _, _, limit, _ in limits) + 10.0, max(5.0, deadline - time.monotonic()))
+            job = {"root": root, "tests": limits, "stop": not decision.delta_run, "wall": wall + 20.0,
+                   "probe": decision.probe, "warm": slot.warm}
+            if decision.delta_run:
+                job["delta"] = {"pinned": CHECKOUT, "files": decision.delta_files,
+                                "pool": str(MAPS / "pool_inputs.json"),
+                                "seconds": [seconds[n] for n in to_run],
+                                "cost": [min(run_cost[n], DELTA_ITEM_COST) for n in to_run]}
+            slot.submit(job,
                         {"decision": decision, "root": root, "failed": False,
                          "probed": not decision.probe,
-                         "since": time.monotonic(), "ran": 0, "planned": len(to_run),
+                         "since": time.monotonic(), "ran": 0, "planned": len(to_run), "passed": set(),
                          "expected": sum(run_cost[n] for n in to_run)})
             running += 1
             return
@@ -650,8 +794,12 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                         if not ok:
                             log(f"{handle['decision'].commit}: FAILED {tests[number]['id']}")
                             DIAG_INFO["failed"].add(handle["decision"].commit)
-                        if ok and not handle["failed"]:
+                            if any(number in guard for guard in handle["decision"].guards.values()):
+                                DIAG_INFO.setdefault("guard_failed", set()).add(handle["decision"].commit)
+                        if ok:
+                            # a test that ran and passed is cleared, whatever else failed
                             answers[handle["decision"].commit].discard(number)
+                            handle["passed"].add(number)
                         else:
                             handle["failed"] = True
                     elif event[0] == "P":
@@ -668,6 +816,12 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                                 f"{len(decision.drop_when_clean)} long tests")
                             answers[decision.commit] -= decision.drop_when_clean
                             DIAG_INFO["drops"] += 1
+                        for long_test, guard in decision.guards.items():
+                            if guard <= handle["passed"] and long_test in answers[decision.commit]:
+                                log(f"{decision.commit}: its {len(guard)} guards passed, letting go of "
+                                    f"{tests[long_test]['id']}")
+                                answers[decision.commit].discard(long_test)
+                                DIAG_INFO["guard_drops"] += 1
                         log(f"{handle['decision'].commit}: ran {handle['ran']}/{handle['planned']} in "
                             f"{time.monotonic() - handle['since']:.2f}s (expected {handle['expected']:.2f}s)")
                         runner.remove_overlay(handle["root"])
