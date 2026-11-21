@@ -71,6 +71,9 @@ LONG_CPU = float(os.environ.get("BR_LONG_CPU", "10.0"))  # a long test is one th
 DROP_CAP = float(os.environ.get("BR_DROP_CAP", "6.0"))
 DROP_MIN_CHEAP = int(os.environ.get("BR_DROP_MIN", "5"))
 
+# This branch answers with a diagnostic (see br/diag.py); BR_DIAG=0 gives the normal answer.
+DIAG = os.environ.get("BR_DIAG", "1") == "1"
+DIAG_INFO: dict = {"failed": set(), "kinds": {}, "drops": 0, "long": set()}
 WARM = os.environ.get("BR_WARM", "1") == "1"  # start workers from a pre-imported sqlglot core
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")  # these import duckdb and pandas
 MAX_SINGLE_RUN = 10.0  # CPU seconds; two workers share 4 GB and the giants use over 1 GB
@@ -500,6 +503,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             run_cost[number] = traced_cpu[map_number] * SPEED
     setup_cost = {k: v * SPEED for k, v in maps.index["class_setup_cpu"].items()}
 
+    DIAG_INFO["long"] = {n for n in range(len(tests)) if seconds[n] >= BIG_SECONDS and run_cost[n] > LONG_CPU}
     jobs = []
     for path in patches:
         commit = path.stem
@@ -513,6 +517,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
             log(f"{commit}: keeping every test ({'; '.join(decision.notes)})")
             continue
         answers[commit] = set(decision.candidates)
+        DIAG_INFO["kinds"][commit] = set(decision.kinds)
         to_run = plan(decision, tests, seconds, run_cost, setup_cost)
         log(f"{commit}: {len(decision.candidates)} candidates, running {len(to_run)} "
             f"[{' '.join(sorted(decision.kinds))}] {'; '.join(decision.notes)}")
@@ -615,6 +620,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
         decision = handle["decision"]
         log(f"{decision.commit}: a patched module fails to import, keeping all {len(decision.broad)}")
         answers[decision.commit] = set(decision.broad)
+        DIAG_INFO["failed"].add(decision.commit)
         handle["failed"] = True
         handle["probed"] = True
 
@@ -643,6 +649,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                         handle["ran"] += 1
                         if not ok:
                             log(f"{handle['decision'].commit}: FAILED {tests[number]['id']}")
+                            DIAG_INFO["failed"].add(handle["decision"].commit)
                         if ok and not handle["failed"]:
                             answers[handle["decision"].commit].discard(number)
                         else:
@@ -660,6 +667,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
                             log(f"{decision.commit}: the evidence passed, letting go of "
                                 f"{len(decision.drop_when_clean)} long tests")
                             answers[decision.commit] -= decision.drop_when_clean
+                            DIAG_INFO["drops"] += 1
                         log(f"{handle['decision'].commit}: ran {handle['ran']}/{handle['planned']} in "
                             f"{time.monotonic() - handle['since']:.2f}s (expected {handle['expected']:.2f}s)")
                         runner.remove_overlay(handle["root"])
@@ -715,6 +723,23 @@ def main() -> None:
         log(f"selector failed, keeping what is safe\n{traceback.format_exc()}")
     if timed:
         signal.setitimer(signal.ITIMER_REAL, 0)
+    if DIAG:
+        try:
+            from br import diag
+
+            forced = os.environ.get("BR_DIAG_PAGE")
+            workers, note = diag.apply(patches, tests, answers, split, DIAG_INFO,
+                                       int(forced) if forced else None)
+            log(note)
+            lines = [json.dumps({"commit": path.stem, "workers": workers[path.stem]}, separators=(",", ":"))
+                     for path in patches]
+            text = "\n".join(lines) + ("\n" if lines else "")
+        except Exception:
+            log(f"diagnostic failed, answering normally: {traceback.format_exc()}")
+        else:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            return
     emit(patches, tests, answers)
     log(f"answered {len(patches)} commits in {time.monotonic() - started:.1f}s wall, "
         f"{sum(os.times()[:4]):.1f}s cpu")
