@@ -816,13 +816,7 @@ def solve(patches: list[Path], tests: list[dict], answers: dict[str, set[int]], 
     # The executor class's tables: parsed here once when at least two jobs would
     # otherwise each parse them (see harness.SharedTables).
     def shares_tables(decision, to_run):
-        # the tables come from CSV files and tests/helpers.py: an edited .sql fixture
-        # leaves them as they were, anything else under tests/ might not
-        def harmless(path):
-            return (not path.startswith("tests/")
-                    or (path.startswith("tests/fixtures/") and path.endswith(".sql")))
-
-        return (SHARE_TABLES and all(harmless(path) for path in decision.files)
+        return (SHARE_TABLES and not any(path.startswith("tests/") for path in decision.files)
                 and any(tests[n]["file"] == harness.SharedTables.FILE for n in to_run))
 
     from br import harness
